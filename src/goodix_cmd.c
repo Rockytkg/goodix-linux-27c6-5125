@@ -1,4 +1,5 @@
 /* goodix_cmd.c - 命令层（命令字节与功能对应）
+ * SPDX-License-Identifier: GPL-2.0-or-later
  *
  * 命令字节 = (cmd0<<4)|(cmd1<<1)：
  *   ResetSensor    0xA2  cmd0=10 cmd1=1  data={1,20}   [复位 MCU 与指纹模块]

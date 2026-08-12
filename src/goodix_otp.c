@@ -1,4 +1,5 @@
 /* goodix_otp.c - OTP 解析 + 224B 配置表补丁。
+ * SPDX-License-Identifier: GPL-2.0-or-later
  *
  * 背景：
  *   初始化顺序是 读OTP -> OTP解析 -> FDT 初始化 -> 配置下发。

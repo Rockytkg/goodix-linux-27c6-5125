@@ -1,4 +1,5 @@
 /* goodix_base.c - FDT 基线持久化与学习（goodix.dat 基线机制）
+ * SPDX-License-Identifier: GPL-2.0-or-later
  *
  * 基线相关逻辑：
  *   - 基线文件加载（init 末尾）：加载 goodix.dat，CRC 校验 +

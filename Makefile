@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-2.0-or-later
 CC      ?= gcc
 CFLAGS  ?= -O2 -Wall -Wextra -Iinclude $(shell pkg-config --cflags libusb-1.0)
 # openssl: pkg-config available on Debian/Ubuntu

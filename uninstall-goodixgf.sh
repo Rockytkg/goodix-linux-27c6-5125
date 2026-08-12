@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: GPL-2.0-or-later
 # uninstall-goodixgf.sh - 完全卸载 goodixgf 驱动的 libfprint 安装及其全部依赖
 #
 # 用法：bash uninstall-goodixgf.sh [libfprint 源码目录]

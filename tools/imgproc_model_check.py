@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-2.0-or-later
 """逐字节一致性验证：goodix_imgproc.c（默认参数）vs 参考模型（GX_IMGPROC_DEFAULT_PARAMS）。
 
 无第三方依赖（纯标准库）。合成多组 16bit LE 帧 + 无手指基线，断言：

@@ -1,4 +1,5 @@
 /* goodix_frame.c - 帧层（明文命令帧 / TLS 帧 / 响应帧的封装与解析）
+ * SPDX-License-Identifier: GPL-2.0-or-later
  *
  * == 明文命令帧 ==
  *   [0]    = 0xA0（类型；低半字节保留上一次的值，首次为 0）

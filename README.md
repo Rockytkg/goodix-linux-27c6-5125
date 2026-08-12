@@ -171,11 +171,23 @@ src/
   得分 0 → 按压位置/关键点不重复，靠注册时位置分散（默认 5 次，位置重复的按压会被驱动拒绝重按）+ 反锐化增强解决；得分 10-19 → 阈值略高，调低 `GF_SIGFM_SCORE_THRESHOLD`（src/goodixgf.c）。升级算法/图像链后必须执行 `fprintd-delete $USER` 并重新 enroll（已注册模板与当前引擎绑定）。
 - **SIGFM 关键点不足 / 想提升匹配**：预处理管线（`src/goodix_imgproc.c`）驱动默认走 `GX_IMGPROC_SIGFM_PARAMS`（**反锐化增强开启**）；`GOODIX_IMGPROC_ENHANCE=none` 可关。标定时 `GOODIX_DUMP_IMGPROC=1` 逐级查看 `raw8/base8/flat8/final8/enh8`，再用 `GOODIX_IMGPROC_BOOST`/`GOODIX_IMGPROC_SIGMA` 调增强强度。参数由 env 驱动，修改后必须 `fprintd-delete $USER` 重新 enroll。
 
+## 致谢
+
+本项目能落地离不开以下开源社区与项目的支持，特此致谢：
+
+- **[goodix-fp-linux-dev/libfprint](https://github.com/goodix-fp-linux-dev/libfprint)** — 社区维护的 libfprint fork，提供 `libfprint-sigfm` 分支与 **SIGFM**（OpenCV SIFT 关键点 + 几何一致性投票）匹配算法。本项目的 libfprint 驱动基于该分支集成（git 子模块）。
+- **[libfprint](https://gitlab.freedesktop.org/libfprint/libfprint)（freedesktop）** — libfprint 上游项目，`FpImageDevice` 等驱动框架 API 来自上游。
+- **goodix-fp-linux-dev 社区** — 对 Goodix 指纹模组协议的逆向与分析工作，为协议实现提供了重要参考。
+- 构建与运行依赖的开源项目：**libusb**、**mbedtls**、**OpenSSL/libcrypto**、**zlib**、**OpenCV**（SIFT）、**fprintd** 等。
+
+再次感谢所有上游维护者与贡献者。
+
 ## 许可与合规
 
-- **项目代码**：本项目自有代码基于 **GPL-2.0-or-later** 许可发布（见 [LICENSE](LICENSE)）。
+- **项目代码**：本项目自有代码基于 **GPL-2.0-or-later** 许可发布（见 [LICENSE](LICENSE)），各文件许可以其文件头 **SPDX** 声明为准。
+- **libfprint 驱动胶水层**：`src/goodixgf.c` 为 **LGPL-2.1-or-later**（与上游 libfprint 驱动许可保持一致）。
 - **第三方代码**：`libfprint/` 为 git 子模块，指向 [goodix-fp-linux-dev/libfprint](https://github.com/goodix-fp-linux-dev/libfprint) 的 `libfprint-sigfm` 分支，其许可以其上游声明为准。
-- **固件**：`firmware/st411sec_app.bin` 版权归原厂商所有，仅限在你合法拥有的设备上用于兼容性使用，本项目不主张其版权，亦不对其再分发权利作任何保证（详见 [firmware/README.md](firmware/README.md)）。
+- **固件**：`firmware/st411sec_app.bin` 及 `include/goodix_fw.h` 内嵌的固件数据版权归原厂商所有，**不属于本项目开源许可范围**，仅限在你合法拥有的设备上用于兼容性使用；本项目不主张其版权，亦不对其再分发权利作任何保证（详见 [firmware/README.md](firmware/README.md)）。
 - **厂商密钥**：PSK 为每台设备首次初始化时随机生成并写入其本地 MCU；本项目不含任何厂商密钥或受控安全材料，仅用于授权实验与开源社区。
 - **无关联声明**：本项目与汇顶科技（Goodix Technology）及任何指纹模组厂商无任何关联，未获其授权、认可或支持。
 

@@ -1,4 +1,5 @@
 /* transport.c - libusb bulk transport for Goodix 27c6:5125
+ * SPDX-License-Identifier: GPL-2.0-or-later
  *
  * DEVICE (verified from fingerprint.pcap, pkt7/pkt9 = 27c6:5125):
  *   USB CDC-ACM device, 2 interfaces:

@@ -1,4 +1,5 @@
 /* goodix_fwupdate.c - STM32 MCU 固件下载
+ * SPDX-License-Identifier: GPL-2.0-or-later
  *
  * （项目 8 = ST32 3626, 27c6:5125, ST411SEC）。
  *

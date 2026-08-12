@@ -1,4 +1,5 @@
 /* goodix_init.c - device activation sequence
+ * SPDX-License-Identifier: GPL-2.0-or-later
  *
  * 设备初始化序列。仅 OS 层 API（libusb, usleep）不同，其余逻辑与
  * 参考实现一致。

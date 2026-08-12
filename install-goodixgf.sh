@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: GPL-2.0-or-later
 # install-goodixgf.sh - 构建并安装带 goodixgf 驱动（SIGFM 匹配）的 libfprint
 #                      （27c6:5125 / 27c6:5135）
 #

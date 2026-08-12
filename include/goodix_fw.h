@@ -1,3 +1,7 @@
+/* 自动生成文件：内嵌 ST411SEC APP 固件数据（firmware/st411sec_app.bin）。
+ * 固件数据版权归原厂商所有，仅限在合法设备上兼容性使用；
+ * 该文件不属于本项目原创代码，不适用本项目开源许可。
+ */
 /* 自动生成：ST411SEC APP 固件数据（firmware/st411sec_app.bin） */
 #ifndef GOODIX_FW_H
 #define GOODIX_FW_H

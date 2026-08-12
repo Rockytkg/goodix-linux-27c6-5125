@@ -1,4 +1,5 @@
 /* goodix_psk.c - PSK 管理
+ * SPDX-License-Identifier: GPL-2.0-or-later
  *
  * PSK 生命周期：
  *   首次初始化：生成随机 32B PSK -> 白盒 AES-GCM 加密 -> 写入 MCU

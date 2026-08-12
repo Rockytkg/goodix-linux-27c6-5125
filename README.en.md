@@ -171,11 +171,23 @@ Frame formats, the command table, TLS, FDT, the classification algorithm, and th
   Score 0 → press position/keypoints do not repeat; fix via dispersed enrollment positions (5 presses by default; repeated positions are rejected by the driver) + unsharp enhancement. Score 10-19 → threshold is slightly high; lower `GF_SIGFM_SCORE_THRESHOLD` (src/goodixgf.c). After any algorithm/image-chain upgrade you must `fprintd-delete $USER` and re-enroll (registered templates are bound to the current engine).
 - **Too few SIGFM keypoints / want better matching**: the preprocessing pipeline (`src/goodix_imgproc.c`) uses `GX_IMGPROC_SIGFM_PARAMS` by default in the driver (**unsharp enhancement on**); `GOODIX_IMGPROC_ENHANCE=none` disables it. For calibration, set `GOODIX_DUMP_IMGPROC=1` to inspect `raw8/base8/flat8/final8/enh8` stage by stage, then tune the enhancement strength with `GOODIX_IMGPROC_BOOST`/`GOODIX_IMGPROC_SIGMA`. Parameters are env-driven; after changing them you must `fprintd-delete $USER` and re-enroll.
 
+## Acknowledgements
+
+This project would not exist without the support of the following open-source communities and projects — thank you:
+
+- **[goodix-fp-linux-dev/libfprint](https://github.com/goodix-fp-linux-dev/libfprint)** — a community-maintained libfprint fork providing the `libfprint-sigfm` branch and the **SIGFM** matching algorithm (OpenCV SIFT keypoints + geometric consistency voting). This project's libfprint driver is integrated on top of that branch (git submodule).
+- **[libfprint](https://gitlab.freedesktop.org/libfprint/libfprint) (freedesktop)** — the upstream libfprint project; driver-framework APIs such as `FpImageDevice` come from upstream.
+- **the goodix-fp-linux-dev community** — their reverse-engineering and analysis of the Goodix fingerprint-module protocol provided an important reference for this implementation.
+- Build/runtime dependencies: **libusb**, **mbedtls**, **OpenSSL/libcrypto**, **zlib**, **OpenCV** (SIFT), **fprintd**, and others.
+
+Thanks again to all upstream maintainers and contributors.
+
 ## License & compliance
 
-- **Project code**: the project's own code is released under **GPL-2.0-or-later** (see [LICENSE](LICENSE)).
+- **Project code**: the project's own code is released under **GPL-2.0-or-later** (see [LICENSE](LICENSE)); each file's license is declared by its **SPDX** header.
+- **libfprint driver glue**: `src/goodixgf.c` is **LGPL-2.1-or-later** (kept consistent with the upstream libfprint driver license).
 - **Third-party code**: `libfprint/` is a git submodule pointing at the `libfprint-sigfm` branch of [goodix-fp-linux-dev/libfprint](https://github.com/goodix-fp-linux-dev/libfprint); its license follows its upstream declaration.
-- **Firmware**: `firmware/st411sec_app.bin` is copyrighted by its original vendor and is provided solely for compatibility use on devices you legally own. This project makes no claim of ownership over it and gives no warranty regarding its redistribution (see [firmware/README.md](firmware/README.md)).
+- **Firmware**: `firmware/st411sec_app.bin` and the firmware data embedded in `include/goodix_fw.h` are copyrighted by their original vendor and are **not covered by this project's open-source license**. They are provided solely for compatibility use on devices you legally own. This project makes no claim of ownership over them and gives no warranty regarding their redistribution (see [firmware/README.md](firmware/README.md)).
 - **Vendor keys**: the PSK is randomly generated on each device at first initialization and written to that device's local MCU. This project contains no vendor keys or controlled security materials; it is intended for authorized experimentation and the open-source community.
 - **No affiliation**: this project is not affiliated with, endorsed by, or supported by Goodix Technology or any fingerprint-module vendor.
 

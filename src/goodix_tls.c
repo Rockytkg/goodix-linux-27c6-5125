@@ -1,4 +1,5 @@
 /* goodix_tls.c - mbedtls PSK TLS server
+ * SPDX-License-Identifier: GPL-2.0-or-later
  *
  * mbedtls server 配置：
  *   - PSK identity："Client_identity"（设备以客户端身份连接）

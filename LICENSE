@@ -1,3 +1,39 @@
+================================================================================
+ goodix-linux — LICENSE
+================================================================================
+
+This repository's original code is licensed under the GNU General Public
+License, version 2, or (at your option) any later version
+(SPDX identifier: GPL-2.0-or-later).
+
+Copyright (C) 2026 liushicong (Rockytkg)
+
+Per-file licensing is declared by the SPDX-License-Identifier header in each
+source file. Scope and exceptions:
+
+  * Project original code (src/, include/ headers, tools/, Makefile,
+    install-goodixgf.sh, uninstall-goodixgf.sh)
+        -> GPL-2.0-or-later
+  * src/goodixgf.c
+        -> LGPL-2.1-or-later (libfprint driver glue, kept compatible with
+           the upstream libfprint driver license)
+  * libfprint/ (git submodule, goodix-fp-linux-dev/libfprint)
+        -> third-party code; its license follows its upstream declaration
+  * firmware/st411sec_app.bin and the firmware data embedded in
+    include/goodix_fw.h
+        -> vendor-copyrighted firmware. NOT covered by this license and NOT
+           redistributed under it. Provided solely for compatibility use on
+           devices you legally own.
+
+中文摘要：
+  本项目自有代码按 GPL-2.0-or-later（GPLv2 或其后任一版本）发布。
+  src/goodixgf.c 为 LGPL-2.1-or-later（libfprint 驱动胶水层）。
+  firmware/st411sec_app.bin 及 include/goodix_fw.h 内嵌的固件数据版权
+  归原厂商所有，不属于本项目许可范围，仅限在合法设备上兼容性使用。
+
+The complete text of the GNU General Public License, Version 2 follows.
+================================================================================
+
                     GNU GENERAL PUBLIC LICENSE
                        Version 2, June 1991
 

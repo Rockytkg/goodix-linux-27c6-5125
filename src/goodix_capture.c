@@ -1,4 +1,5 @@
 /* goodix_capture.c - 图像采集（POV 唤醒路径 + 手指判别图像路径 + 基线采样）。
+ * SPDX-License-Identifier: GPL-2.0-or-later
  *
  * 架构说明（对照参考实现行为 + ST411SEC 固件交互确认）：
  *   - 本机 chipid 0x2504 -> sensor type 12 (ChicagoH)，SetMode 是真实

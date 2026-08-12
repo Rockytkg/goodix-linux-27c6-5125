@@ -1,4 +1,5 @@
 /* main.c - 命令行调试工具
+ * SPDX-License-Identifier: GPL-2.0-or-later
  *
  * 用法：
  *   sudo ./goodix-cli            # 完整初始化（复位→版本→chipid→PSK→TLS）+ 采集
