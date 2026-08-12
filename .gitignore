@@ -1,0 +1,35 @@
+# ---- Build artifacts ----
+*.o
+*.a
+*.so
+goodix-cli
+/build/
+build/
+
+# ---- Captured / dumped images (runtime outputs) ----
+image-*.pgm
+imgproc-*.pgm
+
+# ---- Runtime state files (never commit) ----
+*.dat
+psk.bin
+
+# ---- Editor / IDE ----
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# ---- Logs ----
+*.log
+
+# ---- Local tooling / scratch ----
+.claude/
+.codegraph/
+.ace-tool/
+.playwright-mcp
+.agents
+__pycache__/
+*.pyc

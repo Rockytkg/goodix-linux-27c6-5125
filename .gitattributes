@@ -1,0 +1,19 @@
+# Normalize line endings: LF for all text files (helps cross-platform builds,
+# and the install script already converts CRLF -> LF on the target host).
+* text=auto
+
+*.c     text eol=lf
+*.h     text eol=lf
+*.cpp   text eol=lf
+*.hpp   text eol=lf
+*.md    text eol=lf
+*.sh    text eol=lf
+*.py    text eol=lf
+*.rules text eol=lf
+Makefile   text eol=lf
+*.build    text eol=lf
+*.txt      text eol=lf
+
+# Binary / firmware files stay untouched
+*.bin   binary
+*.pgm   binary
