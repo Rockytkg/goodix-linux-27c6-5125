@@ -87,7 +87,7 @@ The script installs dependencies (incl. OpenCV ≥ 4.5, doctest), copies the dri
 ### fprintd biometric authentication
 
 ```sh
-fprintd-enroll -f right-index-finger $USER   # enroll (5 presses, vary positions)
+fprintd-enroll -f right-index-finger $USER   # enroll (dynamic sampling: 3-8 presses; wider coverage converges sooner)
 fprintd-verify $USER                          # verify
 fprintd-delete $USER                          # delete enrolled template
 fprintd-list $USER                            # list enrolled fingerprints
@@ -168,7 +168,7 @@ Frame formats, the command table, TLS, FDT, the classification algorithm, and th
   sudo env G_MESSAGES_DEBUG=all /usr/libexec/fprintd   # or /usr/lib/fprintd
   # in another terminal: fprintd-verify $USER, watch for "sigfm score N/20"
   ```
-  Score 0 → press position/keypoints do not repeat; fix via dispersed enrollment positions (5 presses by default; repeated positions are rejected by the driver) + unsharp enhancement. Score 10-19 → threshold is slightly high; lower `GF_SIGFM_SCORE_THRESHOLD` (src/goodixgf.c). After any algorithm/image-chain upgrade you must `fprintd-delete $USER` and re-enroll (registered templates are bound to the current engine).
+  Score 0 → press position/keypoints do not repeat; fix via dispersed enrollment positions (dynamic sampling: `GF_ENROLL_MIN_STAGES`=3 to `GF_ENROLL_MAX_STAGES`=8 presses, converging early once positions start repeating `GF_ENROLL_DUP_STOP` times; repeated positions are rejected by the driver) + unsharp enhancement. Score 10-19 → threshold is slightly high; lower `GF_SIGFM_SCORE_THRESHOLD` (src/goodixgf.c). After any algorithm/image-chain upgrade you must `fprintd-delete $USER` and re-enroll (registered templates are bound to the current engine).
 - **Too few SIGFM keypoints / want better matching**: the preprocessing pipeline (`src/goodix_imgproc.c`) uses `GX_IMGPROC_SIGFM_PARAMS` by default in the driver (**unsharp enhancement on**); `GOODIX_IMGPROC_ENHANCE=none` disables it. For calibration, set `GOODIX_DUMP_IMGPROC=1` to inspect `raw8/base8/flat8/final8/enh8` stage by stage, then tune the enhancement strength with `GOODIX_IMGPROC_BOOST`/`GOODIX_IMGPROC_SIGMA`. Parameters are env-driven; after changing them you must `fprintd-delete $USER` and re-enroll.
 
 ## Acknowledgements

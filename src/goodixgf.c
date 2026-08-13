@@ -46,10 +46,16 @@
  * FPI_IMAGE_COLORS_INVERTED 仅供上层按实际极性显示。 */
 #define GF_IMAGE_FLAGS FPI_IMAGE_COLORS_INVERTED
 
-/* 注册需要的按压次数。SIGFM 模板由多帧 SIFT 关键点集合组成，5 次按压
- * （每次位置分散，见 gf_enroll_frame_dup 的多样性检查）即可覆盖手指主要
- * 区域；位置重复的按压对模板无增益，会被拒绝重按。 */
-#define GF_ENROLL_STAGES 5
+/* 动态 enrollment —— 空间覆盖收敛 + 上下限封顶：
+ *   80x64 单帧只覆盖手指一小块区域，SIGFM 模板由多帧 SIFT 关键点集合
+ *   组成。位置分散的按压（见 gf_enroll_frame_dup 的多样性检查）逐步覆盖
+ *   主要区域；连续 GF_ENROLL_DUP_STOP 次位置重复按压说明用户已无新位置
+ *   可采，采满 GF_ENROLL_MIN_STAGES 后即以当前帧为收尾帧提前完成。
+ *   下限保证基本覆盖，上限封顶避免无休止采集（基类 nr_enroll_stages 的
+ *   初值设为 GF_ENROLL_MAX_STAGES，收敛后运行期下调）。 */
+#define GF_ENROLL_MIN_STAGES  3
+#define GF_ENROLL_MAX_STAGES  8
+#define GF_ENROLL_DUP_STOP    2
 #define GF_ENROLL_NPIX   (GOODIXGF_IMG_W * GOODIXGF_IMG_H)
 /* enroll 多样性阈值：两帧 8bit 图像的平均绝对差低于该值即判为"同一位置
  * 重复按压"（SIFT 关键点几乎一致）。可经 GOODIX_ENROLL_MIN_DIFF 覆盖。 */
@@ -67,7 +73,9 @@ struct _FpiDeviceGoodixGF
    * 之后仅在采集 worker 线程访问。 */
   gboolean          enroll;            /* 当前会话是否为 enroll */
   int               accepted_count;    /* 已接受的 enroll 帧数 */
-  uint8_t           accepted[GF_ENROLL_STAGES][GF_ENROLL_NPIX]; /* 已接受帧 */
+  uint8_t           accepted[GF_ENROLL_MAX_STAGES][GF_ENROLL_NPIX]; /* 已接受帧 */
+  gboolean          enroll_converged;  /* 空间覆盖已收敛，交付收尾帧直到完成 */
+  int               dup_streak;        /* 连续位置重复按压次数 */
 };
 
 G_DECLARE_FINAL_TYPE (FpiDeviceGoodixGF, fpi_device_goodixgf,
@@ -114,9 +122,10 @@ gf_enroll_frame_dup (const uint8_t *new8,
 typedef struct
 {
   FpiDeviceGoodixGF *self;
-  FpImage           *image;    /* 用于 image_captured */
-  GError            *error;    /* 用于 open/session 错误 */
-  gboolean           present;  /* 用于手指状态 */
+  FpImage           *image;          /* 用于 image_captured */
+  GError            *error;          /* 用于 open/session 错误 */
+  gboolean           present;        /* 用于手指状态 */
+  gint               enroll_stages;  /* 0=不改；>0 在交付前下调 nr_enroll_stages */
 } GfMainMsg;
 
 static void
@@ -143,6 +152,13 @@ static gboolean
 gf_on_image_captured (gpointer user_data)
 {
   GfMainMsg *msg = user_data;
+  /* enroll 空间覆盖收敛：先下调基类 nr_enroll_stages 再交付收尾帧，保证
+   * 基类在新帧成功提取后命中 enroll_stage == nr_enroll_stages 提前完成。
+   * fpi_device_set_nr_enroll_stages 内部 g_object_notify，必须在主上下文
+   * 调用（本回调即主上下文）。 */
+  if (msg->enroll_stages > 0)
+    fpi_device_set_nr_enroll_stages (FP_DEVICE (msg->self),
+                                     msg->enroll_stages);
   fpi_image_device_image_captured (FP_IMAGE_DEVICE (msg->self),
                                    g_steal_pointer (&msg->image));
   gf_msg_free (msg);
@@ -180,6 +196,21 @@ gf_post (FpiDeviceGoodixGF *self, GSourceFunc func,
   msg->error = error;
   msg->present = present;
   g_idle_add (func, msg);
+}
+
+/* 交付一个收尾帧并在主上下文下调基类 nr_enroll_stages 到 target_stages。
+ * 用于 enroll 收敛：把当前（重复）帧作为模板的最后一帧交给基类，同时把
+ * nr_enroll_stages 改为 accepted_count + 1，使基类在下一次 minutiae_detected
+ * 后提前完成。时序：仅在主上下文（gf_on_image_captured）中触发 setter，
+ * 保证先改值后交付帧。 */
+static void
+gf_post_enroll_close (FpiDeviceGoodixGF *self, FpImage *image, gint target_stages)
+{
+  GfMainMsg *msg = g_new0 (GfMainMsg, 1);
+  msg->self = g_object_ref (self);
+  msg->image = image;
+  msg->enroll_stages = target_stages;
+  g_idle_add (gf_on_image_captured, msg);
 }
 
 /* ------------------------------------------------------------------ */
@@ -249,25 +280,46 @@ gf_capture_worker (gpointer user_data)
            * SIGFM 的 SIFT 特征对分辨率不敏感，无需放大；ppmm 仅供上层显示。 */
           fimg->ppmm = 500.0 / 25.4;
 
-          /* enroll 多样性：与某张已接受帧位置重复（关键点几乎一致）的
-           * 按压对模板无增益，拒绝交付并触发 retry-scan，提示换位置重按。
-           * verify/identify 每次会话只交付一帧，不受影响。 */
-          if (self->enroll && self->accepted_count > 0 &&
-              gf_enroll_frame_dup (fimg->data, self->accepted,
-                                   self->accepted_count))
+          /* enroll 动态采样 —— 空间覆盖收敛 + 上下限封顶：
+           *   与某张已接受帧位置重复（关键点几乎一致）的按压对模板无
+           *   增益，通常拒绝并提示换位置；但连续 GF_ENROLL_DUP_STOP 次
+           *   重复且已采满 GF_ENROLL_MIN_STAGES 说明用户已无新位置可采，
+           *   接受该帧作为收尾帧，并在主上下文把基类 nr_enroll_stages 下调
+           *   为 accepted_count + 1，使基类提前完成。verify/identify 每次
+           *   会话只交付一帧，不受影响。 */
+          if (self->enroll && !self->enroll_converged)
             {
-              fp_warn ("enroll press too similar to a previous one - "
-                       "move finger and try again");
-              gf_post (self, gf_on_retry_scan, NULL, NULL, FALSE);
-              g_object_unref (fimg);
-              /* 等手指抬起，基类 retry-scan 后回 await-finger-on，
-               * 等待下一次位置不同的按压。 */
-              gx_wait_finger_up (gx, 15000);
-              continue;
+              if (self->accepted_count > 0 &&
+                  gf_enroll_frame_dup (fimg->data, self->accepted,
+                                       self->accepted_count))
+                {
+                  self->dup_streak++;
+                  if (self->accepted_count >= GF_ENROLL_MIN_STAGES &&
+                      self->accepted_count < GF_ENROLL_MAX_STAGES &&
+                      self->dup_streak >= GF_ENROLL_DUP_STOP)
+                    {
+                      self->enroll_converged = TRUE;
+                      fp_info ("enroll coverage converged at %d stages",
+                               self->accepted_count + 1);
+                      gf_post_enroll_close (self, fimg,
+                                            self->accepted_count + 1);
+                      gx_wait_finger_up (gx, 15000);
+                      continue;
+                    }
+                  fp_warn ("enroll press too similar to a previous one - "
+                           "move finger and try again");
+                  gf_post (self, gf_on_retry_scan, NULL, NULL, FALSE);
+                  g_object_unref (fimg);
+                  /* 等手指抬起，基类 retry-scan 后回 await-finger-on，
+                   * 等待下一次位置不同的按压。 */
+                  gx_wait_finger_up (gx, 15000);
+                  continue;
+                }
+              self->dup_streak = 0;
+              if (self->accepted_count < GF_ENROLL_MAX_STAGES)
+                memcpy (self->accepted[self->accepted_count++],
+                        fimg->data, GF_ENROLL_NPIX);
             }
-          if (self->enroll && self->accepted_count < GF_ENROLL_STAGES)
-            memcpy (self->accepted[self->accepted_count++],
-                    fimg->data, GF_ENROLL_NPIX);
 
           fp_dbg ("captured %ux%u image, delivering at 500 DPI",
                   gx->img_w, gx->img_h);
@@ -397,11 +449,17 @@ gf_activate (FpImageDevice *dev)
     }
   /* 已完成的 open 线程仍持有一个可 join 的 GThread 句柄。 */
   g_clear_pointer (&self->worker, g_thread_join);
-  /* enroll 时启用多样性检查（5 次按压位置须分散）；verify/identify/capture
-   * 每次会话只交付一帧，无需检查。 */
+  /* enroll 时启用多样性检查（按压位置须分散，动态采样见 gf_capture_worker）；
+   * verify/identify/capture 每次会话只交付一帧，无需检查。 */
   self->enroll = fpi_device_get_current_action (FP_DEVICE (dev)) ==
                  FPI_DEVICE_ACTION_ENROLL;
   self->accepted_count = 0;
+  self->dup_streak = 0;
+  self->enroll_converged = FALSE;
+  /* nr_enroll_stages 是实例字段，可能在上次 enroll 收敛时被运行期下调，
+   * 每次会话开始复位到上限，保证动态采样有完整的收敛空间。gf_activate
+   * 运行于主上下文，此处调用 setter 安全。 */
+  fpi_device_set_nr_enroll_stages (FP_DEVICE (dev), GF_ENROLL_MAX_STAGES);
   g_atomic_int_set (&self->worker_stop, FALSE);
   self->worker = g_thread_new ("goodixgf-capture", gf_capture_worker, self);
   fpi_image_device_activate_complete (dev, NULL);
@@ -439,10 +497,11 @@ fpi_device_goodixgf_class_init (FpiDeviceGoodixGFClass *klass)
   dev_class->type = FP_DEVICE_TYPE_USB;
   dev_class->id_table = id_table;
   dev_class->scan_type = FP_SCAN_TYPE_PRESS;
-  /* 80x64 传感器单帧只覆盖手指一小块区域。5 次按压（每次位置分散，
-   * 位置重复的按压被 gf_enroll_frame_dup 拒绝重按）即可覆盖主要区域，
-   * 验证按压与任一模板的重叠足够稳定（SIGFM 匹配对 <5 即得分 0）。 */
-  dev_class->nr_enroll_stages = GF_ENROLL_STAGES;
+  /* 80x64 传感器单帧只覆盖手指一小块区域，采用动态采样（空间覆盖收敛
+   * + 上下限封顶）：初值设为 GF_ENROLL_MAX_STAGES，运行期在位置连续重复、
+   * 且已采满 GF_ENROLL_MIN_STAGES 时下调到实际帧数提前完成。上限封顶避免
+   * 无休止采集，下限保证基本覆盖（SIGFM 匹配对 <5 即得分 0）。 */
+  dev_class->nr_enroll_stages = GF_ENROLL_MAX_STAGES;
   dev_class->temp_hot_seconds = -1;
 
   img_class->img_open = gf_img_open;

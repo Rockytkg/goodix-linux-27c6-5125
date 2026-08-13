@@ -87,7 +87,7 @@ bash install-goodixgf.sh
 ### fprintd 生物认证
 
 ```sh
-fprintd-enroll -f right-index-finger $USER   # 注册（5 次按压，位置须分散）
+fprintd-enroll -f right-index-finger $USER   # 注册（动态采样：3-8 次按压，位置分散、覆盖越全越早收敛）
 fprintd-verify $USER                          # 验证
 fprintd-delete $USER                          # 删除已注册模板
 fprintd-list $USER                            # 查看已注册
@@ -168,7 +168,7 @@ src/
   sudo env G_MESSAGES_DEBUG=all /usr/libexec/fprintd   # 或 /usr/lib/fprintd
   # 另开终端 fprintd-verify $USER，观察 "sigfm score N/20"
   ```
-  得分 0 → 按压位置/关键点不重复，靠注册时位置分散（默认 5 次，位置重复的按压会被驱动拒绝重按）+ 反锐化增强解决；得分 10-19 → 阈值略高，调低 `GF_SIGFM_SCORE_THRESHOLD`（src/goodixgf.c）。升级算法/图像链后必须执行 `fprintd-delete $USER` 并重新 enroll（已注册模板与当前引擎绑定）。
+  得分 0 → 按压位置/关键点不重复，靠注册时位置分散（动态采样：至少 3 次、至多 8 次，位置连续重复即收敛、提前完成，重复按压由驱动拒绝重按）+ 反锐化增强解决；得分 10-19 → 阈值略高，调低 `GF_SIGFM_SCORE_THRESHOLD`（src/goodixgf.c）。升级算法/图像链后必须执行 `fprintd-delete $USER` 并重新 enroll（已注册模板与当前引擎绑定）。
 - **SIGFM 关键点不足 / 想提升匹配**：预处理管线（`src/goodix_imgproc.c`）驱动默认走 `GX_IMGPROC_SIGFM_PARAMS`（**反锐化增强开启**）；`GOODIX_IMGPROC_ENHANCE=none` 可关。标定时 `GOODIX_DUMP_IMGPROC=1` 逐级查看 `raw8/base8/flat8/final8/enh8`，再用 `GOODIX_IMGPROC_BOOST`/`GOODIX_IMGPROC_SIGMA` 调增强强度。参数由 env 驱动，修改后必须 `fprintd-delete $USER` 重新 enroll。
 
 ## 致谢

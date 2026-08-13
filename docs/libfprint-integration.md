@@ -111,7 +111,7 @@
   # 另开终端：fprintd-verify $USER，观察 "sigfm score N/20"
   ```
 
-  得分 0 = 匹配对 <5（位置/关键点不重复）→ 靠注册时位置分散（默认 5 次，位置重复的按压由驱动拒绝重按）+ 增强解决；得分在 10-19 = 阈值略高 → 调低 `GF_SIGFM_SCORE_THRESHOLD`（goodixgf.c）后重装。验证时保持同一按压位置。
+  得分 0 = 匹配对 <5（位置/关键点不重复）→ 靠注册时位置分散（动态采样：至少 `GF_ENROLL_MIN_STAGES`=3 次、至多 `GF_ENROLL_MAX_STAGES`=8 次；位置连续 `GF_ENROLL_DUP_STOP` 次重复即收敛、提前完成，位置重复的按压由驱动拒绝重按）+ 增强解决；得分在 10-19 = 阈值略高 → 调低 `GF_SIGFM_SCORE_THRESHOLD`（goodixgf.c）后重装。验证时保持同一按压位置。
 - **极性**：CLI `--capture` 保存的是 `gx_imgproc_to8bit()` 的 80x64 输出，与 SIGFM 提取输入一致。ChicagoHS 连续结构是亮脊线；SIGFM 从 `image->data` 直接提取（SIFT 对极性不敏感），`FPI_IMAGE_COLORS_INVERTED` 供上层按实际极性显示。不要按局部黑色串珠判断极性，那些是谷线内部的接触/电容变化。
 - **suspend/resume**：恢复后 MCU 可能处于休眠态，核心的 GetEvkVersionWithRetry 恢复路径（0xA2 软复位唤醒）会自动处理。
 - **fprintd 与 CLI 互斥**：两者都要独占 USB 接口；用 CLI 调试前先 `systemctl stop fprintd`。

@@ -68,7 +68,7 @@ if command -v apt >/dev/null 2>&1; then
     libglib2.0-dev libgusb-dev libusb-1.0-0-dev libpixman-1-dev \
     libmbedtls-dev libssl-dev zlib1g-dev libudev-dev \
     gobject-introspection libgirepository1.0-dev \
-    libopencv-dev doctest-dev \
+    libopencv-dev doctest-dev systemd-dev\
     fprintd libpam-fprintd
 elif command -v dnf >/dev/null 2>&1 || command -v yum >/dev/null 2>&1; then
   PKG=$(command -v dnf || command -v yum)
@@ -80,7 +80,7 @@ elif command -v dnf >/dev/null 2>&1 || command -v yum >/dev/null 2>&1; then
     glib2-devel libgusb-devel libusbx-devel pixman-devel \
     openssl-devel zlib-devel systemd-devel \
     gobject-introspection-devel \
-    opencv-devel doctest-devel || \
+    opencv-devel doctest-devel systemd-devel || \
     echo "!! 部分依赖安装失败（EPEL 未就绪？），请手动安装 opencv-devel/doctest-devel 后重跑" >&2
   sudo $PKG install -y mbedtls-devel fprintd fprintd-pam || \
     echo "!! mbedtls-devel/fprintd 安装失败（EPEL 未就绪？），请手动安装后重跑" >&2
@@ -250,7 +250,7 @@ cat <<DONE
 安装完成。已注册模板与当前驱动/图像链绑定，升级后请先删除再重新注册：
   fprintd-delete \$USER                        # 删除已注册指纹
   journalctl -u fprintd -b | grep -i goodix   # 应能看到 goodixgf 打开设备
-  fprintd-enroll -f right-index-finger \$USER  # 注册（首次 open 会供应 PSK/采基线，别放手指；5 次按压位置须分散）
+  fprintd-enroll -f right-index-finger \$USER  # 注册（首次 open 会供应 PSK/采基线，别放手指；动态采样 3-8 次，位置分散）
   fprintd-verify \$USER                        # 验证
 
 调优：
