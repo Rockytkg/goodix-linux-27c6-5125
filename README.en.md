@@ -68,8 +68,16 @@ make clean && make
 ### Install the libfprint driver (fprintd biometric authentication)
 
 ```sh
-bash install-goodixgf.sh
+bash install-goodixgf-en.sh
 ```
+
+### Uninstall the libfprint driver
+
+```sh
+bash uninstall-goodixgf-en.sh
+```
+
+This removes all installed components, dependencies, udev rules, state files, and fingerprint data. See the script header for details.
 
 The script installs dependencies (incl. OpenCV ≥ 4.5, doctest), copies the driver into the libfprint fork (SIGFM branch), patches the build files, and compiles/installs. See [docs/libfprint-integration.md](docs/libfprint-integration.md).
 
