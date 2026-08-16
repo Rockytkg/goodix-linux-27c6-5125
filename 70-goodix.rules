@@ -1,3 +1,6 @@
 # /etc/udev/rules.d/70-goodix.rules
-SUBSYSTEM=="usb", ATTRS{idVendor}=="27c6", ATTRS{idProduct}=="5125", MODE="0660", GROUP="plugdev"
-SUBSYSTEM=="usb", ATTRS{idVendor}=="27c6", ATTRS{idProduct}=="5135", MODE="0660", GROUP="plugdev"
+# GROUP=plugdev 仅存在于 Debian/Ubuntu；Fedora/RHEL/Arch 无此组，规则落到
+# root:root。TAG+="uaccess" 由 systemd-logind 对所有发行版生效：登录会话的
+# 活动用户自动获得设备 ACL，非 root 也可直接用 goodix-cli。
+SUBSYSTEM=="usb", ATTRS{idVendor}=="27c6", ATTRS{idProduct}=="5125", MODE="0660", GROUP="plugdev", TAG+="uaccess"
+SUBSYSTEM=="usb", ATTRS{idVendor}=="27c6", ATTRS{idProduct}=="5135", MODE="0660", GROUP="plugdev", TAG+="uaccess"

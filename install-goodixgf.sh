@@ -9,10 +9,12 @@
 # （libfprint-sigfm 分支，跟踪 origin/0x00002a/libfprint-sigfm），
 # 注册/比对使用 SIGFM 算法（OpenCV SIFT 关键点 + 几何一致性投票）。
 #
-# 支持 Debian/Ubuntu（apt）与 CentOS/Rocky/RHEL（dnf/yum，自动启用 EPEL）。
+# 支持 Debian/Ubuntu（apt）与 Fedora / CentOS/Rocky/RHEL（dnf/yum）。
+# Fedora 40+ 直接用主仓库包（libusb1-devel / zlib-ng-compat-devel）；
+# RHEL 系自动启用 EPEL。
 # SIGFM 依赖 OpenCV >= 4.5（SIFT 位于主模块）与 doctest（算法自测），要求：
 #   Ubuntu 22.04+ / Debian 12+（libopencv-dev >= 4.5）
-#   EPEL 9（opencv-devel >= 4.5）
+#   Fedora 40+ 主仓库 / EPEL 9（opencv-devel >= 4.5）
 #
 # 流程：
 #   1. 安装构建依赖（含 opencv4 >= 4.5、doctest）+ fprintd
@@ -60,39 +62,128 @@ else
 fi
 
 # ---------------- 1. 依赖 ----------------
-echo "==> [1/5] 安装依赖（含 SIGFM 所需的 OpenCV>=4.5 / doctest）"
-if command -v apt >/dev/null 2>&1; then
+echo "==> [1/5] 检查/安装依赖（含 SIGFM 所需的 OpenCV>=4.5 / doctest）"
+# 先探测关键构建依赖是否已就绪：全部满足则跳过包管理器安装
+# （Arch/CachyOS 等已自带完整构建链与库的场景，也符合"不引入未装依赖"的约束）。
+# mbedtls 在多数发行版无 .pc 文件，根 meson.build 用 cc.find_library() 定位，
+# 这里只检查 pkg-config 能见到的模块。
+DEP_OK=1
+for m in glib-2.0 gio-unix-2.0 gobject-2.0 gusb libusb-1.0 pixman-1 \
+         openssl zlib libudev gobject-introspection-1.0 \
+         girepository-2.0; do
+  pkg-config --exists "$m" 2>/dev/null || { DEP_OK=0; break; }
+done
+# OpenCV：opencv4/opencv5 任一 .pc 存在即可；个别打包未带 .pc 时
+# （meson 会改走 CMake 配置定位），再用 pacman 包版本兜底
+if [ "$DEP_OK" = "1" ] && ! { pkg-config --exists opencv4 2>/dev/null || \
+                              pkg-config --exists opencv5 2>/dev/null || \
+                              { command -v pacman >/dev/null 2>&1 && \
+                                pacman -Q opencv >/dev/null 2>&1; }; }; then
+  DEP_OK=0
+fi
+# doctest 是 header-only 库，多数发行版不提供 .pc：Arch 查包，其它发行版查 .pc
+if [ "$DEP_OK" = "1" ] && ! { pkg-config --exists doctest 2>/dev/null || \
+                              { command -v pacman >/dev/null 2>&1 && \
+                                pacman -Q doctest >/dev/null 2>&1; }; }; then
+  DEP_OK=0
+fi
+# 构建工具链；dos2unix 仅用于行尾规范化（脚本有 sed 兜底），缺失不阻断
+for t in meson ninja gcc g++ pkg-config python3; do
+  command -v "$t" >/dev/null 2>&1 || { DEP_OK=0; break; }
+done
+
+if [ "$DEP_OK" = "1" ]; then
+  echo "    构建依赖已全部就绪，跳过包管理器安装"
+elif command -v pacman >/dev/null 2>&1; then
+  # Arch/CachyOS。g++/pkg-config/python3 由 gcc/pkgconf/python 提供；
+  # libudev 在 systemd-libs；OpenCV 包名恒为 opencv（4.x 提供 opencv4.pc，
+  # 5.x 提供 opencv5.pc）。
+  # mbedtls 包名随发行版而异：Arch 同时提供 mbedtls（4.x）与 mbedtls3
+  # （3.x LTS），CachyOS 为 mbedtls（4.x）；优先 mbedtls，缺失时回退
+  # mbedtls3（用 sync DB 探测，-Si 不需要网络）。
+  # zlib 与 zlib-ng-compat（提供 zlib ABI，CachyOS 默认）互斥：已装
+  # zlib-ng-compat 时不再请求 zlib，否则 pacman 弹出"删除 zlib-ng-compat
+  # 吗？[y/N]"（--noconfirm 取默认 N）导致整个事务失败。
+  ZLIB_PKG=""
+  pacman -Q zlib-ng-compat >/dev/null 2>&1 || ZLIB_PKG="zlib"
+  MBEDTLS_PKG=mbedtls
+  pacman -Si mbedtls >/dev/null 2>&1 || MBEDTLS_PKG=mbedtls3
+  sudo pacman -S --needed --noconfirm meson ninja gcc pkgconf python \
+    dos2unix glib2 libgusb libusb pixman openssl $ZLIB_PKG systemd-libs \
+    gobject-introspection doctest opencv "$MBEDTLS_PKG" fprintd || \
+    echo "!! 部分依赖安装失败，请手动安装后重跑" >&2
+elif command -v apt >/dev/null 2>&1; then
   PKG=apt
   sudo apt update
+  # systemd 头文件包名随发行版而异：Debian 12 / Ubuntu 22.04 为
+  # libsystemd-dev，Debian 13 / Ubuntu 24.04+ 改名 systemd-dev；
+  # 装错名字会让整个 apt install 失败（set -e 直接中断），先探测。
+  SYSTEMD_DEV=libsystemd-dev
+  apt-cache show systemd-dev >/dev/null 2>&1 && SYSTEMD_DEV=systemd-dev
+  # gobject-introspection 1.80+ 改名（libgirepository-1.0 -> 2.0）：
+  # Debian 13+ / Ubuntu 24.04+ 为 libgirepository-2.0-dev，
+  # libgirepository1.0-dev 已退化为过渡包；先探测新名。
+  GIREPO_DEV=libgirepository1.0-dev
+  apt-cache show libgirepository-2.0-dev >/dev/null 2>&1 && GIREPO_DEV=libgirepository-2.0-dev
   sudo apt install -y meson ninja-build gcc g++ pkg-config python3 dos2unix \
     libglib2.0-dev libgusb-dev libusb-1.0-0-dev libpixman-1-dev \
     libmbedtls-dev libssl-dev zlib1g-dev libudev-dev \
-    gobject-introspection libgirepository1.0-dev \
-    libopencv-dev doctest-dev systemd-dev\
+    gobject-introspection "$GIREPO_DEV" \
+    libopencv-dev doctest-dev "$SYSTEMD_DEV" \
     fprintd libpam-fprintd
 elif command -v dnf >/dev/null 2>&1 || command -v yum >/dev/null 2>&1; then
   PKG=$(command -v dnf || command -v yum)
-  # mbedtls / fprintd / opencv / doctest 在 EPEL（Rocky: crb 或 powertools 可能也需启用）
-  sudo $PKG install -y epel-release 2>/dev/null || true
-  sudo $PKG config-manager --set-enabled crb 2>/dev/null || \
-    sudo $PKG config-manager --set-enabled powertools 2>/dev/null || true
-  sudo $PKG install -y meson ninja-build gcc gcc-c++ pkgconf-pkg-config python3 dos2unix \
-    glib2-devel libgusb-devel libusbx-devel pixman-devel \
-    openssl-devel zlib-devel systemd-devel \
-    gobject-introspection-devel \
-    opencv-devel doctest-devel systemd-devel || \
-    echo "!! 部分依赖安装失败（EPEL 未就绪？），请手动安装 opencv-devel/doctest-devel 后重跑" >&2
-  sudo $PKG install -y mbedtls-devel fprintd fprintd-pam || \
-    echo "!! mbedtls-devel/fprintd 安装失败（EPEL 未就绪？），请手动安装后重跑" >&2
+  # Fedora 40+ 起 libusbx/zlib 包名已变更（libusb1-devel / zlib-ng-compat-devel），
+  # 且 mbedtls/opencv/doctest/fprintd 均在 Fedora 主仓库，无需启用 EPEL/CRB。
+  # RHEL/Rocky/CentOS 保持原名（EPEL 提供 opencv-devel/doctest-devel/mbedtls-devel）。
+  FEDORA_GE40=0
+  if [ -r /etc/os-release ]; then
+    . /etc/os-release
+    if [ "${ID:-}" = "fedora" ]; then
+      # VERSION_ID 缺失/非数字（如 Rawhide）时按新包名处理（支持的 Fedora 均已 >= 40）
+      FEDORA_GE40=$(awk -v v="${VERSION_ID:-99}" 'BEGIN{print (v+0 >= 40) ? 1 : 0}')
+    fi
+  fi
+  if [ "$FEDORA_GE40" = "1" ]; then
+    sudo $PKG install -y meson ninja-build gcc gcc-c++ pkgconf-pkg-config python3 dos2unix \
+      glib2-devel libgusb-devel libusb1-devel pixman-devel \
+      openssl-devel zlib-ng-compat-devel systemd-devel \
+      gobject-introspection-devel \
+      opencv-devel doctest-devel mbedtls-devel fprintd fprintd-pam || \
+      echo "!! 部分依赖安装失败，请手动安装后重跑" >&2
+  else
+    # mbedtls / fprintd / opencv / doctest 在 EPEL（Rocky: crb 或 powertools 可能也需启用）
+    sudo $PKG install -y epel-release 2>/dev/null || true
+    sudo $PKG config-manager --set-enabled crb 2>/dev/null || \
+      sudo $PKG config-manager --set-enabled powertools 2>/dev/null || true
+    sudo $PKG install -y meson ninja-build gcc gcc-c++ pkgconf-pkg-config python3 dos2unix \
+      glib2-devel libgusb-devel libusbx-devel pixman-devel \
+      openssl-devel zlib-devel systemd-devel \
+      gobject-introspection-devel \
+      opencv-devel doctest-devel || \
+      echo "!! 部分依赖安装失败（EPEL 未就绪？），请手动安装 opencv-devel/doctest-devel 后重跑" >&2
+    sudo $PKG install -y mbedtls-devel fprintd fprintd-pam || \
+      echo "!! mbedtls-devel/fprintd 安装失败（EPEL 未就绪？），请手动安装后重跑" >&2
+  fi
 else
   echo "!! 未识别的包管理器：请手动安装 meson/ninja/gcc/glib2/libgusb/libusb/pixman/openssl/zlib/mbedtls/gobject-introspection/fprintd/libopencv-dev/libdoctest-dev" >&2
   exit 1
 fi
 
 # SIGFM 的 SIFT 需要 OpenCV >= 4.5（libfprint/sigfm 编译期硬依赖）。
+# pkg-config 包名随 OpenCV 版本而异：4.x 为 opencv4，5.x 为 opencv5
+# （features2d 模块更名为 features，兼容头仍在），与发行版无关
+# （Debian/Ubuntu/RHEL/Fedora 目前为 4.x，CachyOS/Arch 滚动为 5.x）。
+# 个别打包未带 .pc 时 meson 会改走 CMake 配置定位，这里用包版本兜底。
 OPENCV_VER="$(pkg-config --modversion opencv4 2>/dev/null || true)"
 if [ -z "$OPENCV_VER" ]; then
-  echo "!! 找不到 pkg-config 包 opencv4：libopencv-dev/opencv-devel 未安装或版本过旧" >&2
+  OPENCV_VER="$(pkg-config --modversion opencv5 2>/dev/null || true)"
+fi
+if [ -z "$OPENCV_VER" ] && command -v pacman >/dev/null 2>&1; then
+  OPENCV_VER="$(pacman -Q opencv 2>/dev/null | awk '{print $2}')"
+fi
+if [ -z "$OPENCV_VER" ]; then
+  echo "!! 找不到 OpenCV：libopencv-dev/opencv-devel 未安装或版本过旧" >&2
   exit 1
 fi
 # 数值比较版本（按 . 拆分成整数逐段比较；字符串比较会把 "4.10.0" 误判为
@@ -110,7 +201,7 @@ if ! awk -v v="$OPENCV_VER" '
     }
     BEGIN { exit !(cmp(v, "4.5") >= 0) }'; then
   echo "!! OpenCV 版本 $OPENCV_VER < 4.5，SIGFM 需要 >= 4.5（SIFT 位于主模块）。" >&2
-  echo "   请升级发行版（Ubuntu 22.04+ / Debian 12+ / EPEL9+）或手动安装新版 OpenCV 后重试。" >&2
+  echo "   请升级发行版（Ubuntu 22.04+ / Debian 12+ / Fedora / EPEL9+ / Arch）或手动安装新版 OpenCV 后重试。" >&2
   exit 1
 fi
 echo "    OpenCV $OPENCV_VER 满足 SIGFM 要求"
@@ -131,6 +222,7 @@ cp "$GOODIX_LINUX/src/transport.c" \
    "$GOODIX_LINUX/src/goodix_base.c" \
    "$GOODIX_LINUX/src/goodix_otp.c" \
    "$GOODIX_LINUX/src/goodix_imgproc.c" \
+   "$GOODIX_LINUX/src/goodix_crc.c" \
    "$D/core/"
 cp "$GOODIX_LINUX/include/goodix.h" \
    "$GOODIX_LINUX/include/goodix_imgproc.h" \
@@ -181,11 +273,11 @@ endif
     open(p, 'w').write(s)
 
 # --- 3b. libfprint/meson.build：driver_sources 注册（fork 用数组格式） ---
+# 已存在 goodixgf 条目时（本脚本之前跑过）整体替换，保证新增/删除核心源
+# 文件（如 goodix_crc.c）能幂等生效；不存在时在 goodixmoc 之后追加。
 p = src + '/libfprint/meson.build'
 s = open(p).read()
-if "'goodixgf'" not in s:
-    anchor = "    'goodixmoc' :\n        [ 'drivers/goodixmoc/goodix.c', 'drivers/goodixmoc/goodix_proto.c' ],\n"
-    entry = """    'goodixgf' :
+entry = """    'goodixgf' :
         [ 'drivers/goodixgf/goodixgf.c',
           'drivers/goodixgf/core/transport.c',
           'drivers/goodixgf/core/goodix_frame.c',
@@ -197,22 +289,55 @@ if "'goodixgf'" not in s:
           'drivers/goodixgf/core/goodix_capture.c',
           'drivers/goodixgf/core/goodix_base.c',
           'drivers/goodixgf/core/goodix_otp.c',
-          'drivers/goodixgf/core/goodix_imgproc.c' ],
+          'drivers/goodixgf/core/goodix_imgproc.c',
+          'drivers/goodixgf/core/goodix_crc.c' ],
 """
+if "'goodixgf'" in s:
+    import re
+    pat = re.compile(r"    'goodixgf' :\n        \[.*?\],\n", re.S)
+    if not pat.search(s):
+        sys.exit("!! libfprint/meson.build 中 goodixgf 条目格式异常，请手动检查")
+    s = pat.sub(entry, s, count=1)
+else:
+    anchor = "    'goodixmoc' :\n        [ 'drivers/goodixmoc/goodix.c', 'drivers/goodixmoc/goodix_proto.c' ],\n"
     if anchor not in s:
         sys.exit("!! libfprint/meson.build 中找不到 goodixmoc 源文件锚点（fork 结构变化？），"
                  "请手动在 driver_sources 中加 goodixgf 条目")
     s = s.replace(anchor, anchor + entry, 1)
+open(p, 'w').write(s)
+
+# --- 3c. sigfm/meson.build：OpenCV pkg-config 名 opencv4/opencv5 双兼容 ---
+# pkg-config 名随 OpenCV 版本而异：4.x 为 opencv4，5.x 为 opencv5
+# （features2d 模块同时更名为 features，兼容头 features2d.hpp 仍在），
+# 与发行版无关（Debian/Fedora 当前 4.x，CachyOS/Arch 滚动 5.x）。
+# 两者均满足 SIFT >= 4.5，逐一探测。fork 可能因 meson submodule 重置
+# 回到 dependency('opencv4')，此步幂等保证每次运行都适配。
+p = src + '/libfprint/sigfm/meson.build'
+s = open(p).read()
+if "'opencv5'" not in s:
+    old = "opencv = dependency('opencv4', required: true)"
+    new = """# OpenCV 的 pkg-config 名随版本而异：4.x 为 opencv4，5.x 为 opencv5
+# （features2d 模块更名为 features，兼容头仍在）。
+opencv = dependency('opencv4', required: false)
+if not opencv.found()
+  opencv = dependency('opencv5', required: true)
+endif"""
+    if old not in s:
+        sys.exit("!! sigfm/meson.build 中找不到 opencv4 依赖行（fork 结构变化？），"
+                 "请手动在 sigfm/meson.build 中加 opencv5 回退")
+    s = s.replace(old, new, 1)
     open(p, 'w').write(s)
-print('patched: optional_deps + driver_sources (goodixgf)')
+print('patched: optional_deps + driver_sources (goodixgf) + sigfm opencv fallback')
 PYEOF
 
 # ---------------- 4. 编译安装 ----------------
 echo "==> [4/5] 编译安装"
 if command -v dpkg >/dev/null 2>&1; then
   LIBDIR="lib/$(gcc -dumpmachine)"     # Debian/Ubuntu 多架构目录
+elif command -v pacman >/dev/null 2>&1; then
+  LIBDIR="lib"                          # Arch/CachyOS：统一 /usr/lib
 else
-  LIBDIR="lib64"                        # CentOS/Rocky/RHEL
+  LIBDIR="lib64"                        # Fedora/CentOS/Rocky/RHEL
 fi
 # 保持 introspection 开启（fork 默认值）：tests/meson.build 依赖它生成驱动测试，
 # 关闭可能在配置阶段触发问题。GIR 生成问题已由行尾规范化根治。
@@ -243,6 +368,33 @@ echo "==> [5/5] 安装 udev 规则 + 重启 fprintd"
 sudo install -m 0644 "$GOODIX_LINUX/70-goodix.rules" /etc/udev/rules.d/
 sudo udevadm control --reload-rules
 sudo udevadm trigger
+
+# 让 fprintd 常驻：默认 ExecStart=/usr/lib/fprintd 无 --no-timeout，
+# fprintd 在空闲约 30 秒后退出，登录界面等待期间设备会被关闭，
+# 用户首次触摸往往落空、需重按，表现为"开机指纹登录很慢"
+# （而 sudo 时 fprintd 是热启动/设备已打开，所以按上就好）。
+# 加 drop-in 注入 --no-timeout：守护进程常驻、设备保持打开，
+# 登录/锁屏/验证都能按上即响应。
+FPRINTD_SVC=/usr/lib/systemd/system/fprintd.service
+FPRINTD_DROPIN=/etc/systemd/system/fprintd.service.d/keepalive.conf
+if [ -f "$FPRINTD_SVC" ]; then
+  # 从服务文件提取实际 fprintd 可执行路径（Arch/Debian/Ubuntu 不同）
+  FPRINTD_EXEC="$(sed -n 's/^ExecStart=//p' "$FPRINTD_SVC" | head -1)"
+  FPRINTD_EXEC="${FPRINTD_EXEC%% *}"
+  if [ -n "$FPRINTD_EXEC" ] && [ -x "$FPRINTD_EXEC" ]; then
+    sudo mkdir -p "$(dirname "$FPRINTD_DROPIN")"
+    if [ ! -f "$FPRINTD_DROPIN" ]; then
+      printf '[Service]\nExecStart=\nExecStart=%s --no-timeout\n' \
+        "$FPRINTD_EXEC" | sudo tee "$FPRINTD_DROPIN" >/dev/null
+      echo "    fprintd 常驻已启用（--no-timeout，设备保持打开）"
+    else
+      echo "    fprintd 常驻 drop-in 已存在，跳过"
+    fi
+    sudo systemctl daemon-reload
+  else
+    echo "    !! 未找到 fprintd 可执行文件，跳过常驻配置" >&2
+  fi
+fi
 sudo systemctl restart fprintd
 
 cat <<DONE
