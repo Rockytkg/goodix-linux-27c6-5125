@@ -60,8 +60,12 @@ A userspace Linux fingerprint driver that implements the complete protocol stack
 ### Build the CLI (command-line debugging tool)
 
 ```sh
-sudo apt install libusb-1.0-0-dev libmbedtls-dev libssl-dev zlib1g-dev
-sudo dnf install libusb1-devel openssl-devel mbedtls-devel zlib-ng-compat-devel cmake
+# Debian / Ubuntu
+sudo apt install build-essential pkg-config libusb-1.0-0-dev libmbedtls-dev libssl-dev zlib1g-dev
+# Fedora
+sudo dnf install gcc make pkgconf-pkg-config libusb1-devel openssl-devel mbedtls-devel zlib-ng-compat-devel
+# Arch Linux
+sudo pacman -S --needed base-devel libusb mbedtls openssl zlib
 make clean && make
 ```
 

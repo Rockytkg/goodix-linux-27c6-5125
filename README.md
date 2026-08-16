@@ -60,7 +60,12 @@ Linux 用户态指纹驱动，基于原生 API（libusb + mbedtls + OpenSSL）�
 ### 构建 CLI（命令行调试工具）
 
 ```sh
-sudo apt install libusb-1.0-0-dev libmbedtls-dev libssl-dev zlib1g-dev
+# Debian / Ubuntu
+sudo apt install build-essential pkg-config libusb-1.0-0-dev libmbedtls-dev libssl-dev zlib1g-dev
+# Fedora
+sudo dnf install gcc make pkgconf-pkg-config libusb1-devel openssl-devel mbedtls-devel zlib-ng-compat-devel
+# Arch Linux
+sudo pacman -S --needed base-devel libusb mbedtls openssl zlib
 make clean && make
 ```
 
