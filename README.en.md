@@ -61,6 +61,7 @@ A userspace Linux fingerprint driver that implements the complete protocol stack
 
 ```sh
 sudo apt install libusb-1.0-0-dev libmbedtls-dev libssl-dev zlib1g-dev
+sudo dnf install libusb1-devel openssl-devel mbedtls-devel zlib-ng-compat-devel cmake
 make clean && make
 ```
 
