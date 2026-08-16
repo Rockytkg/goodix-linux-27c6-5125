@@ -11,7 +11,6 @@
 #include <stdlib.h>
 #include <string.h>
 #include "goodix.h"
-#include <stdlib.h>
 
 /* 图像缓冲 = 解包后的 16bit LE 像素（有效值 12bit，0..4095）。
  * PGM 是 gx_imgproc_to8bit() 的输出，与 libfprint 送入 SIGFM（SIFT 提取）

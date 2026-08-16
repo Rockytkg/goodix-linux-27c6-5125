@@ -364,11 +364,8 @@ static gpointer
 gf_open_worker (gpointer user_data)
 {
   FpiDeviceGoodixGF *self = user_data;
-  struct goodix_dev *gx = g_malloc0 (sizeof (*gx));
+  struct goodix_dev *gx = self->gx;   /* gf_img_open 预先分配（close 可取消） */
   int r;
-
-  gx->vid = GOODIX_VID;
-  gx->pid = 0;                      /* 0x5125/0x5135 任一（传输层扫描） */
 
   r = gx_transport_open (gx);
   if (r == 0)
@@ -382,23 +379,25 @@ gf_open_worker (gpointer user_data)
       r = -5;
     }
 
+  /* close 请求（worker_stop）已置位时不回发 open_complete：设备状态由
+   * gf_img_close 统一收尾，避免在 close_complete 之后才报 open 错误。 */
   if (r == 0)
     {
-      self->gx = gx;
       gx_capture_set_event_cb (gx, gf_core_event_cb, self);
       fp_info ("device ready: chipid 0x%04x, %ux%u, TLS %s",
                gx->chipid, gx->img_w, gx->img_h,
                gx->tls_inited ? "inited" : "plaintext");
-      gf_post (self, gf_on_open_complete, NULL, NULL, FALSE);
+      if (!g_atomic_int_get (&self->worker_stop))
+        gf_post (self, gf_on_open_complete, NULL, NULL, FALSE);
     }
   else
     {
-      gx_transport_close (gx);
-      g_free (gx);
-      gf_post (self, gf_on_open_complete, NULL,
-               g_error_new (FP_DEVICE_ERROR, FP_DEVICE_ERROR_GENERAL,
-                            "goodix device init failed (%d)", r),
-               FALSE);
+      gx_transport_close (gx);   /* 释放 USB；gf_img_close 会再调（幂等） */
+      if (!g_atomic_int_get (&self->worker_stop))
+        gf_post (self, gf_on_open_complete, NULL,
+                 g_error_new (FP_DEVICE_ERROR, FP_DEVICE_ERROR_GENERAL,
+                              "goodix device init failed (%d)", r),
+                 FALSE);
     }
   return NULL;
 }
@@ -413,6 +412,12 @@ gf_img_open (FpImageDevice *dev)
   FpiDeviceGoodixGF *self = FPI_DEVICE_GOODIXGF (dev);
 
   g_atomic_int_set (&self->worker_stop, FALSE);
+  /* 核心设备状态在主线程预先分配并挂到 self->gx：open 进行中 close 也能
+   * 通过 gx_capture_cancel 中断长初始化（evk 唤醒重试/重枚举轮询会检查
+   * capture_stop 快速退出），close 线程 join 不会等上十几秒。 */
+  self->gx = g_malloc0 (sizeof (*self->gx));
+  self->gx->vid = GOODIX_VID;
+  self->gx->pid = 0;                /* 0x5125/0x5135 任一（传输层扫描） */
   self->worker = g_thread_new ("goodixgf-open", gf_open_worker, self);
 }
 
@@ -422,6 +427,8 @@ gf_img_close (FpImageDevice *dev)
   FpiDeviceGoodixGF *self = FPI_DEVICE_GOODIXGF (dev);
 
   g_atomic_int_set (&self->worker_stop, TRUE);
+  /* self->gx 在 gf_img_open 就绪（open 失败也保留），取消总能送达；
+   * 核心的初始化/采集/重枚举轮询都会检查 capture_stop 快速退出。 */
   if (self->gx)
     gx_capture_cancel (self->gx);
   g_clear_pointer (&self->worker, g_thread_join);
@@ -429,7 +436,7 @@ gf_img_close (FpImageDevice *dev)
   if (self->gx)
     {
       gx_capture_set_event_cb (self->gx, NULL, NULL);
-      gx_transport_close (self->gx);
+      gx_transport_close (self->gx);   /* open 失败路径已关过，幂等 */
       g_clear_pointer (&self->gx, g_free);
     }
   fpi_image_device_close_complete (dev, NULL);

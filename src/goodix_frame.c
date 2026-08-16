@@ -134,14 +134,23 @@ int gx_read_frame(struct goodix_dev *d, uint8_t *frame, uint16_t *len, int tmo)
             deadline -= 100;
             continue;
         }
-        if (r < 4)
+        /* 非进展路径同样消耗预算：每次读最多阻塞 100ms。若只对错误路径
+         * 扣减，噪声帧/半包会让本函数实际超时无上界（可远大于 tmo）。 */
+        if (r < 4) {
+            deadline -= 100;
             continue;
-        if ((buf[0] >> 4) != 0xA && (buf[0] >> 4) != 0xB && (buf[0] >> 4) != 0xC)
+        }
+        if ((buf[0] >> 4) != 0xA && (buf[0] >> 4) != 0xB && (buf[0] >> 4) != 0xC) {
+            deadline -= 100;
             continue;
-        if (buf[3] != hdr_cks(buf[0], buf[1], buf[2]))
+        }
+        if (buf[3] != hdr_cks(buf[0], buf[1], buf[2])) {
+            deadline -= 100;
             continue;
+        }
         paylen = (uint16_t)(buf[1] | (buf[2] << 8));
         if (paylen < 1 || paylen > MAX_FRAME - 4) {
+            deadline -= 100;
             continue;
         }
         total = (uint16_t)(paylen + 4);

@@ -63,6 +63,10 @@ static int gf_modify_config(uint8_t *cfg, uint16_t reg, uint16_t val,
         return 0;
     uint8_t off = cfg[2 * section + 1];
     uint8_t cnt = cfg[2 * section + 2];
+    /* 防御：表项区必须落在 224B 配置表内且按 4B 步进。当前 4 张静态表
+     * 均已验证合法，此检查防止未来新增表写错时越界读。 */
+    if (cnt % 4 != 0 || (uint16_t)off + cnt > 224)
+        return 0;
     for (int i = 0; i < cnt; i += 4) {
         uint16_t r = (uint16_t)(cfg[off + i] | (cfg[off + i + 1] << 8));
         if (r != reg)

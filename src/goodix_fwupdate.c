@@ -3,21 +3,21 @@
  *
  * （项目 8 = ST32 3626, 27c6:5125, ST411SEC）。
  *
- * 固件 blob 布局（128430 字节）：
- *   [0]        = 1 字节版本字符串长度（0x15 = 21）
- *   [1..21]    = "GF_ST411SEC_APP_12508"
- *   [22..]     = 固件镜像（128404 字节）
- *   [末 4]     = 尾部（不传输）
+ * 固件数据（include/goodix_fw.h 内嵌的 gf_fw = firmware/st411sec_app.bin
+ * 原始镜像，128404 字节，以 ARM 向量表开头）：
+ *   gf_fw[]        = 固件镜像（128404 字节，直接传输，不含版本前缀）
+ *   GF_FW_VERSION  = "GF_ST411SEC_APP_12508"（仅用于版本比较）
+ *   GF_FW_CRC      = 镜像的 CRC-32/MPEG-2（0x6FBC0F40，运行时校验）
  *
  * 固件更新流程：
  *   1. MCU 不在 IAP 且版本相同           -> 无需更新（返回 1）
  *   2. MCU 不在 IAP 且版本不同           -> 清除 APP（0xA4）
  *      + 硬复位 + 重读 EVK 版本 -> 返回 -2097165（软复位）
- *   3. MCU 在 IAP -> 传输固件（&blob[22], 128404）：
+ *   3. MCU 在 IAP -> 传输固件（gf_fw, 128404）：
  *      - 1008 字节分片，命令 0xF0 {off32,len32,data}，evt5
  *      - 结束命令 0xF4 {0,0,len32,crc32}，evt5（MCU 校验 CRC）
  *      - CRC32 为非反射（init 0xFFFFFFFF，poly 0x04C11DB7，
- *        MSB 优先，无最终异或）= 本固件的 0x6FBC0F40。
+ *        MSB 优先，无最终异或）= 本固件的 0x6FBC0F40
  *   4. 传输成功 -> 硬复位 -> 返回 -2097165
  *
  * init 阶段将 -2097165 作为"软复位，停止初始化"标记向上传播
@@ -29,36 +29,6 @@
 #include "goodix_fw.h"
 
 #define FW_SLICE 1008
-
-/* ---- 非反射 CRC32 ---- */
-static uint32_t crc32_noreflect_table[256];
-
-static void crc32_noreflect_init(void)
-{
-    static int done = 0;
-    if (done)
-        return;
-    for (unsigned i = 0; i < 256; i++) {
-        uint32_t c = i << 24;
-        for (int j = 0; j < 8; j++) {
-            if (c & 0x80000000u)
-                c = (c << 1) ^ 0x04C11DB7u;
-            else
-                c <<= 1;
-        }
-        crc32_noreflect_table[i] = c;
-    }
-    done = 1;
-}
-
-static uint32_t crc32_noreflect(const uint8_t *p, uint32_t len, uint32_t crc)
-{
-    crc32_noreflect_init();
-    while (len--) {
-        crc = (crc << 8) ^ crc32_noreflect_table[(uint8_t)(*p++ ^ (crc >> 24))];
-    }
-    return crc;
-}
 
 /* ---- 传输一个分片：0xF0 {off32le, len32le, data} ---- */
 static int fw_send_slice(struct goodix_dev *d, const uint8_t *fw,
@@ -112,6 +82,15 @@ static int fw_update_core(struct goodix_dev *d, const uint8_t *fw, uint32_t tota
 
     LOG("firmware download: %u bytes, %u frames", total, frames);
 
+    /* 内嵌固件完整性预检：GF_FW_CRC 与运行时计算的 CRC-32/MPEG-2 不符
+     * （镜像损坏 / 生成脚本出错）时直接拒绝，避免把坏固件刷进 MCU。 */
+    crc = gx_crc32_mpeg2(fw, total, 0xFFFFFFFFu);
+    if (crc != GF_FW_CRC) {
+        LOG("embedded firmware CRC mismatch (calc 0x%08X, expected 0x%08X) - "
+            "refusing to flash", crc, GF_FW_CRC);
+        return -6;
+    }
+
     for (uint32_t i = 0; i < frames; i++) {
         uint32_t off = i * FW_SLICE;
         uint32_t len = (total - off > FW_SLICE) ? FW_SLICE : (total - off);
@@ -120,7 +99,7 @@ static int fw_update_core(struct goodix_dev *d, const uint8_t *fw, uint32_t tota
             return r;
     }
 
-    crc = crc32_noreflect(fw, total, 0xFFFFFFFFu);
+    crc = gx_crc32_mpeg2(fw, total, 0xFFFFFFFFu);
     LOG("firmware CRC32: 0x%08X (non-reflected)", crc);
 
     uint8_t status = 0;
@@ -173,13 +152,10 @@ static int fw_update_master(struct goodix_dev *d, uint8_t now_version[64])
             return 1;
         }
         LOG("version differs, Clear App first");
-        int r = fw_clear_app(d);
-        if (r > 0) {
-            LOG("ClearApp done, MCU soft reset");
-            return FW_SOFT_RESET;
-        }
-        /* ClearApp failed: hard reset + re-query version */
-        LOG("ClearApp failed, reset MCU and re-query");
+        /* 0xA4 清除 APP 区；gx_send_cmd_wait 成功返回 0（此前这里
+         * "r > 0" 分支永远不可达，属于死代码——清除后 MCU 重启进入
+         * IAP，下面统一走"重读版本 -> 在 IAP 则下载"路径）。 */
+        fw_clear_app(d);
         usleep(200000);
         memset(now_version, 0, 64);
         gx_dev_evk(d, now_version);

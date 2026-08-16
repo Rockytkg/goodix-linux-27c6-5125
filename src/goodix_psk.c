@@ -354,9 +354,17 @@ int gx_psk_store_load(uint8_t *psk, uint32_t *len)
 {
     const char *path = psk_store_path();
     FILE *f = fopen(path, "rb");
+    size_t got;
     if (!f)
         return -1;
-    size_t got = fread(psk, 1, *len, f);
+    got = fread(psk, 1, *len, f);
+    /* 文件比期望长度还多出内容 = 缓存被破坏/篡改：拒绝采用，让调用方
+     * 走"读 MCU / 重写"自愈路径。 */
+    if (fgetc(f) != EOF) {
+        LOG("PSK store %s oversized (cap %u), rejected", path, *len);
+        fclose(f);
+        return -1;
+    }
     fclose(f);
     if (got < 1)
         return -1;

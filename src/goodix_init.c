@@ -31,6 +31,9 @@
 
 #define RETRY_COUNT 5
 
+/* 定义见文件末尾：设备重枚举后 close + 轮询 reopen（供 evk 唤醒 L3 用） */
+static int gx_transport_reopen(struct goodix_dev *d, int max_ms);
+
 /* ================= 配置下发数据表 =================
  * 每类传感器一份 224 字节配置，按类型偏移组织：base + 224*type，
  * 初始化时把对应 224 字节通过 0x90 (cmd0=9 cmd1=0) 下发给 MCU。
@@ -151,6 +154,8 @@ static int evk_with_retry(struct goodix_dev *d, uint8_t out[64])
 
     /* 层级 0：仅读版本（NOP + 0xA8），重试 retry_count 次 */
     for (int i = 0; i < RETRY_COUNT; i++) {
+        if (gx_stop_requested(d))
+            return -4;              /* 取消（fprintd stop）：快速退出 */
         memset(out, 0, 64);
         r = gx_dev_evk(d, out);
         if (r == 0)
@@ -160,6 +165,8 @@ static int evk_with_retry(struct goodix_dev *d, uint8_t out[64])
     }
 
     /* 层级 1：MCU 软复位 0xA2 {2,20}。唤醒休眠 / 冷启动的 MCU。 */
+    if (gx_stop_requested(d))
+        return -4;
     LOG("wake L1: soft-reset MCU (0xA2 {2,20})");
     uint8_t reset_mcu[2] = { 2, 20 };
     gx_send_cmd(d, 0xA2, reset_mcu, 2, 100);
@@ -171,6 +178,8 @@ static int evk_with_retry(struct goodix_dev *d, uint8_t out[64])
     LOG("GetEvkVersion after L1 wake failed (%d)", r);
 
     /* 层级 2：复位 MCU + 传感器 0xA2 {3,20} */
+    if (gx_stop_requested(d))
+        return -4;
     LOG("wake L2: soft-reset MCU+sensor (0xA2 {3,20})");
     uint8_t reset_both[2] = { 3, 20 };
     gx_send_cmd(d, 0xA2, reset_both, 2, 100);
@@ -182,7 +191,13 @@ static int evk_with_retry(struct goodix_dev *d, uint8_t out[64])
     LOG("GetEvkVersion after L2 wake failed (%d)", r);
 
     /* 层级 3：USB 端口复位（设备加入时主机侧通常会自动执行；
-     * libusb_open 不会）。重新唤醒 MCU 的 USB 外设。 */
+     * libusb_open 不会）。重新唤醒 MCU 的 USB 外设。
+     * gx_usb_reset 内部会重新做 CDC 激活（端口复位会清掉 DTR），
+     * 否则复位后设备依旧静默丢包；若仍无响应，整体 close + 重开
+     * （重新 detach 内核驱动 / claim / CDC 激活），覆盖复位后
+     * 内核重新绑定 cdc_acm 导致句柄失效的情况。 */
+    if (gx_stop_requested(d))
+        return -4;
     LOG("wake L3: USB port reset + retry");
     gx_usb_reset(d);
     usleep(600000);
@@ -191,6 +206,13 @@ static int evk_with_retry(struct goodix_dev *d, uint8_t out[64])
     if (r == 0)
         return 0;
     LOG("GetEvkVersion after L3 USB reset failed (%d)", r);
+    if (gx_transport_reopen(d, 5000) == 0) {
+        memset(out, 0, 64);
+        r = gx_dev_evk(d, out);
+        if (r == 0)
+            return 0;
+        LOG("GetEvkVersion after L3 reopen failed (%d)", r);
+    }
 
     return -1;
 }
@@ -302,14 +324,36 @@ static int init_mcu(struct goodix_dev *d)
     } else {
         LOG("GOODIX_RESET_PSK: ignoring local store, will rewrite");
     }
-    /* Recovery path (no local store): try MCU WB read. 0xBB010003 is the
-     * WB storage segment (production_write_key 2nd TLV). */
-    if (r != 0)
+    /* 自愈（关键）：本地缓存只是缓存，必须与 MCU 持有同一 PSK，TLS 握手
+     * 才可能成功。用 MCU 哈希（0xBB020003）验证本地缓存：
+     *   - 一致（0）     -> 直接用；
+     *   - 不一致（-6）  -> 缓存过期，丢弃后走"读 MCU / 重写"路径；
+     *     典型场景：CLI（~/.config/goodix）与 fprintd（/var/lib/fprint/
+     *     goodix）分属不同状态目录却共享同一 MCU，后写者覆盖 MCU 的 PSK
+     *     使先写者缓存失效；或 WB 密钥更新后 MCU 仍持旧 blob。若信任过期
+     *     缓存，握手必然 bad_record_mac（MBEDTLS_ERR_SSL_INVALID_MAC），
+     *     MCU 进入锁定态，表现为后续 evk 全部超时且无法自愈。
+     *   - 其它错误      -> 传输层暂不可答，保留本地 PSK，下次 init 再校验。 */
+    if (r == 0) {
+        int vr = gx_psk_verify_mcu_hash(d);
+        if (vr == -6) {
+            LOG("local PSK mismatch with MCU - re-sync");
+            r = -1;
+        } else if (vr != 0) {
+            LOG("PSK verify failed (%d), keeping local PSK", vr);
+        }
+    }
+    /* Recovery path (no local store / cache expired): try MCU WB read.
+     * 0xBB010003 is the WB storage segment (production_write_key 2nd TLV).
+     * 成功即 WB 解密已验证密钥一致，并把 MCU 的 PSK 固化回本地缓存。
+     * GOODIX_RESET_PSK 时跳过读 MCU，强制重写新 PSK（与注释语义一致）。 */
+    if (r != 0 && !getenv("GOODIX_RESET_PSK")) {
         r = gx_psk_read_from_mcu(d);
+        if (r == 0)
+            gx_psk_store_save(d->psk, 32);
+    }
     if (r == 0) {
         LOG("PSK valid, no update needed");
-        /* prove WB crypto: MCU hash vs SHA256(WB) */
-        gx_psk_verify_mcu_hash(d);
     } else {
         LOG("PSK invalid (%d), writing new PSK", r);
         uint8_t new_psk[32];
@@ -361,6 +405,8 @@ static int init_fpsensor(struct goodix_dev *d)
     /* --- 读 ChipID：寄存器 0x82 读 4 字节 x retry --- */
     uint16_t chipid = 0;
     for (int i = 0; i < RETRY_COUNT; i++) {
+        if (gx_stop_requested(d))
+            return -4;
         uint16_t rl = 16;
         r = gx_send_cmd_wait(d, GF_CMD_CHIPREG_READ,
                              (const uint8_t[]){ 0, 0, 0, 4, 0 }, 5,
@@ -461,8 +507,13 @@ static int device_init(struct goodix_dev *d)
 static int gx_transport_reopen(struct goodix_dev *d, int max_ms)
 {
     gx_transport_close(d);
+    /* MCU 复位后可能以不同 PID 重新枚举（见上方注释）：扫描任一。
+     * gx_transport_open 匹配成功后会把 d->pid 更新为实际 PID。 */
+    d->pid = 0;
     int waited = 0;
     while (waited < max_ms) {
+        if (gx_stop_requested(d))
+            return -4;              /* 取消：不再等设备重新枚举 */
         usleep(200000);
         waited += 200;
         if (gx_transport_open(d) == 0) {
@@ -481,6 +532,17 @@ int gx_device_init(struct goodix_dev *d)
     LOG("=== device init %04x:%04x ===", d->vid, d->pid);
 
     for (int try = 0; try < RETRY_COUNT; try++) {
+        if (gx_stop_requested(d)) {
+            LOG("device init cancelled");
+            return -4;
+        }
+        /* evk 唤醒 L3 的 reopen 失败会把传输层关掉（usb_devh=NULL）；
+         * 下次重试前先重新打开，避免带着空句柄继续跑（见 transport.c
+         * 的 NULL 防护，这里是主动恢复）。 */
+        if (!d->usb_devh && gx_transport_open(d) != 0) {
+            LOG("device gone, cannot reopen transport");
+            return -1;
+        }
         r = device_init(d);
         if (r == 0)
             break;

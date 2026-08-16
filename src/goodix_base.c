@@ -34,32 +34,8 @@
 #define BASE_IMG_LEN   10240                /* 图像基线长度（type 12） */
 #define BASE_TAIL_LEN  (BASE_FDT_LEN + BASE_NAV_LEN + BASE_IMG_LEN + 4)
 
-/* CRC-32/MPEG-2 表（MSB-first，poly 0x04C11DB7） */
-static uint32_t crc_tab[256];
-static int crc_tab_ready = 0;
-static void crc32_init_table(void)
-{
-    if (crc_tab_ready)
-        return;
-    for (int i = 0; i < 256; i++) {
-        uint32_t crc = (uint32_t)i << 24;
-        for (int k = 0; k < 8; k++)
-            crc = (crc & 0x80000000u) ? ((crc << 1) ^ 0x04C11DB7u)
-                                      : (crc << 1);
-        crc_tab[i] = crc;
-    }
-    crc_tab_ready = 1;
-}
-
-/* CRC-32 计算：初值 0xFFFFFFFF，无最终异或 */
-static uint32_t base_crc32(const uint8_t *data, size_t len)
-{
-    uint32_t crc = 0xFFFFFFFFu;
-    crc32_init_table();
-    for (size_t i = 0; i < len; i++)
-        crc = (crc << 8) ^ crc_tab[(uint8_t)(data[i] ^ (crc >> 24))];
-    return crc;
-}
+/* CRC-32/MPEG-2（poly 0x04C11DB7，初值 0xFFFFFFFF，无最终异或）的查表
+ * 实现见 goodix_crc.c，与图像线 CRC / 固件 CRC 共用。 */
 
 const char *gx_state_dir(void)
 {
@@ -183,7 +159,7 @@ int gx_base_load(struct goodix_dev *d)
     }
     uint32_t crc_file = (uint32_t)buf[got - 4] | ((uint32_t)buf[got - 3] << 8) |
                         ((uint32_t)buf[got - 2] << 16) | ((uint32_t)buf[got - 1] << 24);
-    uint32_t crc_calc = base_crc32(buf, got - 4);
+    uint32_t crc_calc = gx_crc32_mpeg2(buf, got - 4, 0xFFFFFFFFu);
     if (crc_file != crc_calc) {
         LOG("base file CRC mismatch (file 0x%08x calc 0x%08x), ignored",
             crc_file, crc_calc);
@@ -194,6 +170,18 @@ int gx_base_load(struct goodix_dev *d)
         return -4;
     }
     memcpy(d->fdt_down_base, buf + d->otp_len, BASE_FDT_LEN);
+    /* 文件里的表必须是合法阈值：落盘格式为"高字节=阈值、低字节=0x80"
+     * （见 gx_fdt_learn_down_base / learn_up_base）。此前注释声称"使用文件
+     * 前同样做合法性检查"但实际缺失——补上：阈值字节为 0/0xFF 即视为
+     * 垃圾表（全零存档/损坏/格式不兼容），拒绝采用，走重新采样。 */
+    for (int i = 0; i < BASE_FDT_LEN; i += 2) {
+        uint8_t hi = d->fdt_down_base[i + 1];
+        if (hi == 0 || hi == 0xFF) {
+            LOG("base file FDT table invalid (word%d hi=0x%02x), ignored",
+                i / 2, hi);
+            return -5;
+        }
+    }
     /* imagebase 段（offset = otp + 12 + 3200）：主机侧手指判别的
      * 无手指基线图像（装入全局基线图供判别使用）。
      * type 12 固定 10240B。
@@ -212,7 +200,7 @@ int gx_base_load(struct goodix_dev *d)
             d->img_base_valid = true;
         }
     }
-    /* 文件里的表必须是合法阈值（使用文件前同样做合法性检查） */
+    /* （FDT 表合法性检查已在上方完成） */
     d->base_valid = true;
     LOG("FDT base loaded from %s (CRC+OTP ok%s)", path,
         d->img_base_valid ? ", imagebase ok" : "");
@@ -239,7 +227,7 @@ int gx_base_save(struct goodix_dev *d)
     if (d->img_base_valid && d->img_size == BASE_IMG_LEN)
         memcpy(buf + d->otp_len + BASE_FDT_LEN + BASE_NAV_LEN,
                d->img_base, BASE_IMG_LEN);
-    uint32_t crc = base_crc32(buf, total - 4);
+    uint32_t crc = gx_crc32_mpeg2(buf, total - 4, 0xFFFFFFFFu);
     buf[total - 4] = (uint8_t)crc;
     buf[total - 3] = (uint8_t)(crc >> 8);
     buf[total - 2] = (uint8_t)(crc >> 16);

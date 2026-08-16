@@ -23,10 +23,35 @@
 #include <unistd.h>
 #include <time.h>
 #include <mbedtls/ssl.h>
+#include <mbedtls/version.h>
+/* mbedtls 4.x 移除了 entropy/ctr_drbg 模块（随机性改由 PSA 全局随机源
+ * 提供），旧头文件不再存在。按版本条件包含，保持对 2.x/3.x 的兼容。 */
+#if MBEDTLS_VERSION_NUMBER >= 0x04000000
+#include <psa/crypto.h>
+#else
 #include <mbedtls/entropy.h>
 #include <mbedtls/ctr_drbg.h>
-#include <mbedtls/version.h>
+#endif
 #include "goodix.h"
+
+/* ---- mbedtls 上下文 ----
+ * 流式接收缓冲（bio_recv 聚合）+ 采集模式标志 + 帧重组缓冲都挂在每个
+ * 设备的 TLS 上下文里，避免文件级 static 造成的多设备串扰。定义放在
+ * bio 桥接函数之前（gx_tls_capture_mode / gx_tls_feed 需要访问其字段）。 */
+struct gx_tls_ctx {
+    mbedtls_ssl_context ssl;
+    mbedtls_ssl_config conf;
+    /* mbedtls 4.x 移除 entropy/ctr_drbg：随机性由 PSA 全局随机源提供，
+     * 无需（也不再存在）这两个上下文。 */
+#if MBEDTLS_VERSION_NUMBER < 0x04000000
+    mbedtls_ctr_drbg_context ctr_drbg;
+    mbedtls_entropy_context entropy;
+#endif
+    uint8_t rx_buf[8192];
+    size_t rx_head, rx_tail;
+    int rx_no_usb;
+    uint8_t frame[MAX_FRAME];   /* bio_recv 的帧重组缓冲 */
+};
 
 /* ---- TLS 帧桥接 ----
  * TLS 帧：[0]=0xB0 [1:2]=总长 [3]=校验和 [4..]=TLS 记录 [末]=校验和
@@ -59,52 +84,56 @@ static int tls_bio_send(void *ctx, const unsigned char *buf, size_t len)
  * mbedtls BIO 是流式的：先 recv(5) 读 TLS 记录头，再 recv(n) 读记录体。
  * 接收数据来自聚合缓冲，多余字节会在调用间保留。这里用环形缓冲实现
  * 同样行为：帧中多出的数据保留给下一次 recv()。
- */
-static uint8_t tls_rx_buf[8192];
-static size_t tls_rx_head = 0, tls_rx_tail = 0;
+ *
+ * 缓冲放在 struct gx_tls_ctx（每个设备一份）里而不是文件级 static，
+ * 保证多设备实例/重入安全；采集模式标志同理。 */
+
 /* 采集模式：bio_recv 不再自己读 USB（否则会把设备推送的明文 A0 帧
  * ——FDT 事件/图像——静默吞掉），只 drain gx_tls_feed 注入的缓冲。
  * TLS 激活后明文 A0 帧直接进入采集分流路径，B0 帧才进 ssl_read。 */
-static int tls_rx_no_usb = 0;
 
 void gx_tls_capture_mode(struct goodix_dev *d, int on)
 {
-    (void)d;
-    tls_rx_no_usb = on;
+    struct gx_tls_ctx *t = d->tls;
+    if (t)
+        t->rx_no_usb = on;
 }
 
 /* 把一条设备发来的 TLS record（B0 帧 payload）注入接收缓冲 */
 int gx_tls_feed(struct goodix_dev *d, const uint8_t *record, size_t len)
 {
-    (void)d;
-    if (tls_rx_tail + len > sizeof(tls_rx_buf)) {
+    struct gx_tls_ctx *t = d->tls;
+    if (!t || len > sizeof(t->rx_buf))
+        return -1;
+    if (t->rx_tail + len > sizeof(t->rx_buf)) {
         /* 压缩/复位缓冲，实在放不下就报错 */
-        if (tls_rx_head) {
-            memmove(tls_rx_buf, tls_rx_buf + tls_rx_head,
-                    tls_rx_tail - tls_rx_head);
-            tls_rx_tail -= tls_rx_head;
-            tls_rx_head = 0;
+        if (t->rx_head) {
+            memmove(t->rx_buf, t->rx_buf + t->rx_head,
+                    t->rx_tail - t->rx_head);
+            t->rx_tail -= t->rx_head;
+            t->rx_head = 0;
         }
-        if (tls_rx_tail + len > sizeof(tls_rx_buf))
+        if (t->rx_tail + len > sizeof(t->rx_buf))
             return -1;
     }
-    memcpy(tls_rx_buf + tls_rx_tail, record, len);
-    tls_rx_tail += len;
+    memcpy(t->rx_buf + t->rx_tail, record, len);
+    t->rx_tail += len;
     return 0;
 }
 
 static int tls_bio_recv(void *ctx, unsigned char *buf, size_t len)
 {
     struct goodix_dev *d = ctx;
-    static uint8_t frame[MAX_FRAME];
+    struct gx_tls_ctx *t = d->tls;
+    uint8_t *frame = t->frame;   /* 单设备上下文内的帧缓冲 */
 
     /* 采集模式：USB 读取由调用方驱动（明文帧走采集分流路径），
      * 这里只 drain 注入缓冲，空了就 WANT_READ。 */
-    if (tls_rx_no_usb)
+    if (t->rx_no_usb)
         goto drain;
 
     /* 持续拉取 USB TLS 帧，直到积累 >= len 字节 */
-    while (tls_rx_tail - tls_rx_head < len) {
+    while (t->rx_tail - t->rx_head < len) {
         uint16_t flen = 0;
         int r = gx_read_frame(d, frame, &flen, 500);
         if (r < 0)
@@ -114,16 +143,16 @@ static int tls_bio_recv(void *ctx, unsigned char *buf, size_t len)
         if (frame[0] != GF_TYPE_TLS)
             continue;
         size_t n = flen - 4;
-        if (tls_rx_tail + n > sizeof(tls_rx_buf)) {
+        if (t->rx_tail + n > sizeof(t->rx_buf)) {
             /* 溢出保护：丢弃已缓冲数据并重新填充 */
-            tls_rx_head = tls_rx_tail = 0;
-            if (n > sizeof(tls_rx_buf)) {
+            t->rx_head = t->rx_tail = 0;
+            if (n > sizeof(t->rx_buf)) {
                 LOG("TLS frame too big (%u)", (unsigned)n);
                 return MBEDTLS_ERR_SSL_WANT_READ;
             }
         }
-        memcpy(tls_rx_buf + tls_rx_tail, &frame[4], n);
-        tls_rx_tail += n;
+        memcpy(t->rx_buf + t->rx_tail, &frame[4], n);
+        t->rx_tail += n;
         if (gx_debug) {
             fprintf(stderr, "[goodix] TLS recv +%uB (frame %uB): %02X %02X %02X %02X %02X",
                     (unsigned)n, flen, frame[4], frame[5], frame[6], frame[7], frame[8]);
@@ -146,31 +175,25 @@ static int tls_bio_recv(void *ctx, unsigned char *buf, size_t len)
         }
     }
 drain:;
-    size_t avail = tls_rx_tail - tls_rx_head;
+    size_t avail = t->rx_tail - t->rx_head;
     if (avail == 0)
         return MBEDTLS_ERR_SSL_WANT_READ;
     size_t n = avail < len ? avail : len;
-    memcpy(buf, tls_rx_buf + tls_rx_head, n);
-    tls_rx_head += n;
-    if (tls_rx_head == tls_rx_tail)
-        tls_rx_head = tls_rx_tail = 0;
+    memcpy(buf, t->rx_buf + t->rx_head, n);
+    t->rx_head += n;
+    if (t->rx_head == t->rx_tail)
+        t->rx_head = t->rx_tail = 0;
     return (int)n;
 }
-
-/* ---- mbedtls 上下文 ---- */
-struct gx_tls_ctx {
-    mbedtls_ssl_context ssl;
-    mbedtls_ssl_config conf;
-    mbedtls_ctr_drbg_context ctr_drbg;
-    mbedtls_entropy_context entropy;
-};
 
 /* 初始化 mbedtls PSK server */
 int gx_tls_server_init(struct goodix_dev *d)
 {
     struct gx_tls_ctx *t;
-    const char *pers = "ssl_server2";
     int r;
+#if MBEDTLS_VERSION_NUMBER < 0x04000000
+    const char *pers = "ssl_server2";
+#endif
 
     if (!d->have_psk) {
         LOG("no PSK, cannot init TLS server");
@@ -181,6 +204,19 @@ int gx_tls_server_init(struct goodix_dev *d)
         return -1;
     d->tls = t;
 
+#if MBEDTLS_VERSION_NUMBER >= 0x04000000
+    /* mbedtls 4.x：mbedtls_ssl_setup() 要求先初始化 PSA，随机性由 PSA
+     * 全局随机源提供，不再设置 conf_rng / ctr_drbg。 */
+    r = psa_crypto_init();
+    if (r != PSA_SUCCESS) {
+        LOG("psa_crypto_init: -0x%x", -r);
+        free(t);
+        d->tls = NULL;
+        return -1;
+    }
+    mbedtls_ssl_init(&t->ssl);
+    mbedtls_ssl_config_init(&t->conf);
+#else
     mbedtls_entropy_init(&t->entropy);
     mbedtls_ctr_drbg_init(&t->ctr_drbg);
     mbedtls_ssl_init(&t->ssl);
@@ -189,12 +225,15 @@ int gx_tls_server_init(struct goodix_dev *d)
     r = mbedtls_ctr_drbg_seed(&t->ctr_drbg, mbedtls_entropy_func,
                               &t->entropy, (const unsigned char *)pers, strlen(pers));
     if (r) { LOG("ctr_drbg_seed: -0x%x", -r); goto fail; }
+#endif
 
     r = mbedtls_ssl_config_defaults(&t->conf, MBEDTLS_SSL_IS_SERVER,
                                     MBEDTLS_SSL_TRANSPORT_STREAM, MBEDTLS_SSL_PRESET_DEFAULT);
     if (r) { LOG("config_defaults: -0x%x", -r); goto fail; }
 
+#if MBEDTLS_VERSION_NUMBER < 0x04000000
     mbedtls_ssl_conf_rng(&t->conf, mbedtls_ctr_drbg_random, &t->ctr_drbg);
+#endif
     mbedtls_ssl_conf_authmode(&t->conf, MBEDTLS_SSL_VERIFY_NONE);
 
     /* 将 TLS 版本锁定为 min=max=TLS1.2
@@ -226,6 +265,10 @@ int gx_tls_server_init(struct goodix_dev *d)
         MBEDTLS_TLS_PSK_WITH_AES_128_GCM_SHA256,
         0
     };
+#if MBEDTLS_VERSION_NUMBER >= 0x04000000
+    /* mbedtls 4.x：无 mbedtls_ssl_list_ciphersuites() 运行时列表，
+     * 密码套件可用性由 PSA 配置决定，头文件恒定义 ID，跳过检查。 */
+#else
     /* 检查 0x00A8 是否实际编译进 mbedtls（Ubuntu 通常已包含） */
     {
         const int *list = mbedtls_ssl_list_ciphersuites();
@@ -240,6 +283,7 @@ int gx_tls_server_init(struct goodix_dev *d)
             MBEDTLS_TLS_PSK_WITH_AES_128_GCM_SHA256,
             found ? "AVAILABLE" : "NOT COMPILED (!!)");
     }
+#endif
     mbedtls_ssl_conf_ciphersuites(&t->conf, ciphersuites);
 
     r = mbedtls_ssl_conf_psk(&t->conf, d->psk, d->psk_len,
@@ -260,8 +304,10 @@ int gx_tls_server_init(struct goodix_dev *d)
 fail:
     mbedtls_ssl_free(&t->ssl);
     mbedtls_ssl_config_free(&t->conf);
+#if MBEDTLS_VERSION_NUMBER < 0x04000000
     mbedtls_ctr_drbg_free(&t->ctr_drbg);
     mbedtls_entropy_free(&t->entropy);
+#endif
     free(t);
     d->tls = NULL;
     return r;
@@ -295,6 +341,12 @@ int gx_tls_handshake(struct goodix_dev *d)
                 break;
             if (r != MBEDTLS_ERR_SSL_WANT_READ && r != MBEDTLS_ERR_SSL_WANT_WRITE) {
                 LOG("handshake err -0x%x", -r);
+                /* 收尾：重发 TLS 握手命令，给 MCU 一次解锁机会（state
+                 * bit3 锁定态会阻塞后续命令，见下方确认循环）。PSK 不匹配
+                 * 等根因由 init 的 PSK 自愈路径处理，这里保证 MCU 不在
+                 * 锁定态卡死后续的 evk/init。 */
+                usleep(10000);
+                gx_tls_handshake_cmd(d);
                 return r;
             }
             if (r != last_r || tried < 3) {
@@ -353,7 +405,7 @@ int gx_tls_reconnect(struct goodix_dev *d)
         return -1;
     LOG("TLS reconnect requested, resetting session");
     mbedtls_ssl_session_reset(&t->ssl);
-    tls_rx_head = tls_rx_tail = 0;
+    t->rx_head = t->rx_tail = 0;
     d->tls_inited = false;
     return gx_tls_handshake(d);
 }

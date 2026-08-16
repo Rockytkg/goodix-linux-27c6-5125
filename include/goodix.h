@@ -16,11 +16,11 @@
 #define GOODIX_H
 
 #include <stdint.h>
-
-extern int gx_debug;  /* USB 十六进制转储开关（GOODIX_DEBUG=1） */
 #include <stddef.h>
 #include <stdbool.h>
 #include <stdio.h>
+
+extern int gx_debug;  /* USB 十六进制转储开关（GOODIX_DEBUG=1） */
 
 /* 共享日志宏（所有模块） */
 #define LOG(fmt, ...) fprintf(stderr, "[goodix] " fmt "\n", ##__VA_ARGS__)
@@ -172,6 +172,19 @@ struct goodix_dev {
      * 温度漂移（判别返回 0）时重采更新。 */
     uint8_t img_base[GF_IMG_MAX];
     bool img_base_valid;    /* 基线图像可用（文件加载或 init 采样成功） */
+
+    /* TLS 解密数据聚合缓冲（goodix_capture.c 的混合通道：B0 帧解密后的
+     * 字节流先攒出完整 payload 再分流）。放设备结构里而不是文件级 static，
+     * 保证多设备实例/重入安全。 */
+    uint8_t rx_acc[3 + 0x6C00];
+    size_t rx_acc_len;
+
+    /* 采集接收工作缓冲（goodix_capture.c）：采集路径单线程顺序使用。
+     * rx_scratch 是各采集函数（wait_image / gx_fdt_sample_base /
+     * gx_wait_finger_up，互不并发）的 payload 工作区；rx_frame 是
+     * next_payload 的 USB 帧重组缓冲。同样挂设备上避免文件级 static。 */
+    uint8_t rx_scratch[3 + 0x6C00];
+    uint8_t rx_frame[MAX_FRAME];
 };
 
 /* ---- 传输层 (transport.c) ---- */
@@ -180,6 +193,18 @@ void gx_transport_close(struct goodix_dev *d);
 int gx_usb_write(struct goodix_dev *d, const uint8_t *b, size_t n);
 int gx_usb_read(struct goodix_dev *d, uint8_t *b, size_t cap, int tmo);
 int gx_usb_reset(struct goodix_dev *d);
+
+/* ---- 共享 CRC-32/MPEG-2（goodix_crc.c）----
+ * poly 0x04C11DB7，初值/续值 crc（通常 0xFFFFFFFFu），MSB-first，无最终
+ * 异或。图像线 CRC、goodix.dat 基线 CRC、固件 CRC 三者共用。 */
+uint32_t gx_crc32_mpeg2(const uint8_t *data, size_t len, uint32_t crc);
+
+/* 取消采集（gx_capture_cancel）后长流程（初始化唤醒重试、重枚举轮询、
+ * 采集循环）据此快速退出，避免 fprintd stop/deactivate 等待数秒。 */
+static inline int gx_stop_requested(struct goodix_dev *d)
+{
+    return d->capture_stop;
+}
 
 /* ---- 帧层 (goodix_frame.c) ---- */
 int  gx_send_cmd_frame(struct goodix_dev *d, uint8_t cmd,

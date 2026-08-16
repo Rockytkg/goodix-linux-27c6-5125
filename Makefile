@@ -20,7 +20,7 @@ LIBS += -lm
 SRCS := src/transport.c src/goodix_frame.c src/goodix_cmd.c \
         src/goodix_psk.c src/goodix_tls.c src/goodix_fwupdate.c \
         src/goodix_init.c src/goodix_capture.c src/goodix_base.c \
-        src/goodix_otp.c src/goodix_imgproc.c src/main.c
+        src/goodix_otp.c src/goodix_imgproc.c src/goodix_crc.c src/main.c
 OBJS := $(SRCS:.c=.o)
 
 all: goodix-cli
@@ -28,7 +28,12 @@ all: goodix-cli
 goodix-cli: $(OBJS)
 	$(CC) $(CFLAGS) -o $@ $(OBJS) $(LIBS)
 
-%.o: %.c include/goodix.h include/goodix_imgproc.h include/goodix_fw.h
+# 通用规则只依赖公共头。goodix_fw.h 是 803KB 的固件数据表，只有
+# goodix_fwupdate.c 用到——放进通用依赖会让它一改动就全量重编。
+%.o: %.c include/goodix.h include/goodix_imgproc.h
+	$(CC) $(CFLAGS) -c -o $@ $<
+
+src/goodix_fwupdate.o: src/goodix_fwupdate.c include/goodix_fw.h
 	$(CC) $(CFLAGS) -c -o $@ $<
 
 clean:

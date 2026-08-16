@@ -16,6 +16,7 @@
  * 这里复现该行为以保证全新设备能应答命令。
  */
 #include <libusb-1.0/libusb.h>
+#include <unistd.h>        /* usleep（gx_usb_reset 复位后等待） */
 #include "goodix.h"
 
 int gx_debug = 0;   /* set via GOODIX_DEBUG=1 */
@@ -139,8 +140,11 @@ int gx_transport_open(struct goodix_dev *d)
     d->usb_ctx = ctx;
 
     cnt = libusb_get_device_list(ctx, &list);
-    if (cnt < 0)
+    if (cnt < 0) {
+        libusb_exit(ctx);       /* 失败也要释放 ctx，避免泄漏 */
+        d->usb_ctx = NULL;
         return (int)cnt;
+    }
     for (ssize_t i = 0; i < cnt; i++) {
         struct libusb_device_descriptor dd;
         if (libusb_get_device_descriptor(list[i], &dd))
@@ -180,14 +184,25 @@ int gx_transport_open(struct goodix_dev *d)
 
 /* USB 复位：参考实现（WDF）在设备添加时复位端口（端口复位发生在
  * 参考实现的 USB 初始化中）。libusb 打开时不会复位端口，因此
- * 冷启动设备（挂起后）可能需要一次复位来唤醒 MCU 的 USB 外设。 */
+ * 冷启动设备（挂起后）可能需要一次复位来唤醒 MCU 的 USB 外设。
+ *
+ * 注意：端口复位会清除 CDC 激活状态（SET_LINE_CODING + DTR）——不重新
+ * 激活，设备数据端点会再次静默丢弃所有命令（与初始"零响应"同一根因，
+ * 见 cdc_activate 的注释）。因此复位成功后必须重新做 CDC 激活，否则
+ * 唤醒层级 L3 在 "usb reset done" 之后仍会一直 GetEvkVersion 超时。 */
 int gx_usb_reset(struct goodix_dev *d)
 {
-    int r = libusb_reset_device((libusb_device_handle *)d->usb_devh);
+    int r;
+    if (!d->usb_devh)
+        return LIBUSB_ERROR_NO_DEVICE;
+    r = libusb_reset_device((libusb_device_handle *)d->usb_devh);
     if (r < 0)
         LOG("usb reset failed: %s", libusb_error_name(r));
-    else
+    else {
         LOG("usb reset done");
+        usleep(200000);   /* 等设备重新枚举稳定 */
+        cdc_activate((libusb_device_handle *)d->usb_devh, GF_IFACE_COMM);
+    }
     return r;
 }
 
@@ -208,9 +223,14 @@ void gx_transport_close(struct goodix_dev *d)
 int gx_usb_write(struct goodix_dev *d, const uint8_t *b, size_t n)
 {
     int x = 0;
-    int r = libusb_bulk_transfer((libusb_device_handle *)d->usb_devh,
-                                 d->ep_out ? d->ep_out : 0x01,
-                                 (uint8_t *)b, (int)n, &x, 1000);
+    int r;
+    /* 设备可能在任何时刻被拔出（或 L3 唤醒的 reopen 失败后句柄已关）。
+     * 把 NULL 传给 libusb 是未定义行为（会崩），必须先挡掉。 */
+    if (!d->usb_devh)
+        return LIBUSB_ERROR_NO_DEVICE;
+    r = libusb_bulk_transfer((libusb_device_handle *)d->usb_devh,
+                             d->ep_out ? d->ep_out : 0x01,
+                             (uint8_t *)b, (int)n, &x, 1000);
     if (gx_debug) {
         fprintf(stderr, "[goodix] TX %zuB: ", n);
         for (size_t i = 0; i < n && i < 32; i++)
@@ -225,9 +245,12 @@ int gx_usb_write(struct goodix_dev *d, const uint8_t *b, size_t n)
 int gx_usb_read(struct goodix_dev *d, uint8_t *b, size_t cap, int tmo)
 {
     int x = 0;
-    int r = libusb_bulk_transfer((libusb_device_handle *)d->usb_devh,
-                                 d->ep_in ? d->ep_in : 0x81,
-                                 b, (int)cap, &x, tmo);
+    int r;
+    if (!d->usb_devh)
+        return LIBUSB_ERROR_NO_DEVICE;
+    r = libusb_bulk_transfer((libusb_device_handle *)d->usb_devh,
+                             d->ep_in ? d->ep_in : 0x81,
+                             b, (int)cap, &x, tmo);
     if (gx_debug && r >= 0) {
         fprintf(stderr, "[goodix] RX %dB: ", x);
         for (int i = 0; i < x && i < 32; i++)

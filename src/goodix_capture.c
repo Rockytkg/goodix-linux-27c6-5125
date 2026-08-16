@@ -48,20 +48,8 @@ static int verify_crc(const uint8_t *data, uint16_t len)
 
 /* ---- 线上图像 CRC-32（图像数据 CRC-32 计算）----
  * 与 goodix.dat 同一个 CRC-32/MPEG-2（poly 0x04C11DB7，初值 FFFFFFFF，
- * 无最终异或）。图像数据末尾 4 字节是 CRC，存储序是
- * 每 16 位半字大端、半字间小端：crc = b1|b0<<8 | b3<<16|b2<<24。
- * 逐位计算（免表）。 */
-static uint32_t img_crc32(const uint8_t *data, size_t len)
-{
-    uint32_t crc = 0xFFFFFFFFu;
-    for (size_t i = 0; i < len; i++) {
-        crc ^= (uint32_t)data[i] << 24;
-        for (int k = 0; k < 8; k++)
-            crc = (crc & 0x80000000u) ? ((crc << 1) ^ 0x04C11DB7u)
-                                      : (crc << 1);
-    }
-    return crc;
-}
+ * 无最终异或），查表实现见 goodix_crc.c。图像数据末尾 4 字节是 CRC，
+ * 存储序是每 16 位半字大端、半字间小端：crc = b1|b0<<8 | b3<<16|b2<<24。 */
 
 /* ---- 12bit 解包 + 转置（列优先像素解包）----
  * 线上 6 字节打包 4 个 12bit 像素；像素流是按列优先（每列 64px）发送的，
@@ -151,15 +139,22 @@ int gx_fdt_check_finger(struct goodix_dev *d, const uint8_t *img)
     for (uint8_t br = 0; br < p->brows; br++) {
         for (uint8_t bc = 0; bc < p->bcols; bc++) {
             uint32_t sum_new = 0, sum_base = 0, sum_diff = 0;
+            /* 单遍扫描：像素差异缓存到 di[]（64 像素，|a-b| <= 4095 有符号
+             * 16bit 可容纳），第二遍方差直接读缓存，避免把两幅图像各重读
+             * 一遍。运算顺序与原两遍实现完全一致，结果逐位相同。 */
+            int16_t di[64];
+            uint32_t di_n = 0;
             for (uint8_t m = 0; m < 8; m++) {
                 for (uint8_t n = 0; n < 8; n++) {
                     uint32_t idx = (uint32_t)p->w * (m + p->row_off[br])
                                    + n + p->col_off[bc];
                     uint16_t a = px16(d->img_base, idx);/* 基线 (a2) */
                     uint16_t b = px16(img, idx);        /* 新帧 (a3) */
+                    int16_t diff = (int16_t)((a > b) ? (a - b) : (b - a));
                     sum_base += a;
                     sum_new += b;
-                    sum_diff += (a > b) ? (a - b) : (b - a);
+                    sum_diff += (uint32_t)diff;
+                    di[di_n++] = diff;
                 }
             }
             uint32_t mean_base = sum_base / 64;         /* 块均值（偏移 +56） */
@@ -167,16 +162,9 @@ int gx_fdt_check_finger(struct goodix_dev *d, const uint8_t *img)
             uint32_t mean_diff = sum_diff / 64;         /* 块均值（偏移 +72） */
             /* 块内差异方差（+80）：Σ(mean_d - d_i)^2 / 63 */
             uint64_t var = 0;
-            for (uint8_t m = 0; m < 8; m++) {
-                for (uint8_t n = 0; n < 8; n++) {
-                    uint32_t idx = (uint32_t)p->w * (m + p->row_off[br])
-                                   + n + p->col_off[bc];
-                    uint16_t a = px16(d->img_base, idx);
-                    uint16_t b = px16(img, idx);
-                    int di = (a > b) ? (a - b) : (b - a);
-                    int dd = (int)mean_diff - di;
-                    var += (uint64_t)(dd * dd);
-                }
+            for (uint32_t k = 0; k < 64; k++) {
+                int dd = (int)mean_diff - (int)di[k];
+                var += (uint64_t)(dd * dd);
             }
             var /= 63;
             if (var > (uint32_t)hi)
@@ -268,7 +256,7 @@ static int parse_image_payload(const uint8_t *p, uint16_t plen,
     if (ilen >= 10 && ((ilen - 4) % 6) == 0) {
         uint32_t cw = (uint32_t)w[ilen - 3] | ((uint32_t)w[ilen - 4] << 8) |
                       ((uint32_t)w[ilen - 1] << 16) | ((uint32_t)w[ilen - 2] << 24);
-        uint32_t cc = img_crc32(w, ilen - 4);
+        uint32_t cc = gx_crc32_mpeg2(w, ilen - 4, 0xFFFFFFFFu);
         LOG("capture: image wire CRC32 %s (wire 0x%08x calc 0x%08x)",
             cw == cc ? "OK" : "MISMATCH", cw, cc);
         unsigned int packed = ilen - 4;             /* 7680 */
@@ -369,31 +357,31 @@ void gx_capture_cancel(struct goodix_dev *d)
 /* ---------------- 混合通道 payload 读取 ----------------
  * TLS 激活后 A0 明文帧直接分流到设备数据处理，B0 帧 ssl_read 解密后
  * 同样分流。明文帧整帧即一条 payload；TLS 解密数据是字节流，需要先
- * 攒出完整 payload（cmd+v19+data）。 */
-
-static uint8_t rx_acc[3 + 0x6C00];  /* TLS 解密数据聚合（设备数据上限） */
-static size_t rx_acc_len = 0;
+ * 攒出完整 payload（cmd+v19+data）。
+ * 聚合缓冲（d->rx_acc / d->rx_acc_len）是设备状态的一部分（见 goodix.h），
+ * 采集路径单线程访问，但挂在设备上保证多设备/重入安全。 */
 
 /* 从聚合缓冲取一条完整 payload；取到返回 1 */
-static int acc_take(uint8_t *out, uint16_t *outlen, uint16_t cap)
+static int acc_take(struct goodix_dev *d, uint8_t *out, uint16_t *outlen,
+                    uint16_t cap)
 {
-    if (rx_acc_len < 3)
+    if (d->rx_acc_len < 3)
         return 0;
-    uint16_t v19 = (uint16_t)(rx_acc[1] | (rx_acc[2] << 8));
+    uint16_t v19 = (uint16_t)(d->rx_acc[1] | (d->rx_acc[2] << 8));
     size_t total = 3 + v19;
-    if (v19 < 4 || total > sizeof(rx_acc)) {
+    if (v19 < 4 || total > sizeof(d->rx_acc)) {
         LOG("capture: TLS payload desync (v19=%u), resync", v19);
-        rx_acc_len = 0;
+        d->rx_acc_len = 0;
         return 0;
     }
-    if (rx_acc_len < total)
+    if (d->rx_acc_len < total)
         return 0;
     if (total <= cap) {
-        memcpy(out, rx_acc, total);
+        memcpy(out, d->rx_acc, total);
         *outlen = (uint16_t)total;
     }
-    memmove(rx_acc, rx_acc + total, rx_acc_len - total);
-    rx_acc_len -= total;
+    memmove(d->rx_acc, d->rx_acc + total, d->rx_acc_len - total);
+    d->rx_acc_len -= total;
     return total <= cap;
 }
 
@@ -404,12 +392,12 @@ static int acc_take(uint8_t *out, uint16_t *outlen, uint16_t cap)
 static int next_payload(struct goodix_dev *d, uint8_t *out, uint16_t *outlen,
                         uint16_t cap, int tmo_ms)
 {
-    static uint8_t frame[MAX_FRAME];
+    uint8_t *frame = d->rx_frame;   /* 设备级帧重组缓冲（见 goodix.h） */
     int tls = d->tls_inited && d->tls;
     int deadline = tmo_ms > 0 ? tmo_ms : 200;
 
     while (deadline > 0) {
-        if (acc_take(out, outlen, cap))
+        if (acc_take(d, out, outlen, cap))
             return 1;
         uint16_t flen = 0;
         int r = gx_read_frame(d, frame, &flen, 200);
@@ -427,12 +415,12 @@ static int next_payload(struct goodix_dev *d, uint8_t *out, uint16_t *outlen,
                 int n = gx_tls_recv(d, tmp, sizeof(tmp), 0);
                 if (n <= 0)
                     break;          /* WANT_READ / 暂无更多 */
-                if (rx_acc_len + (size_t)n > sizeof(rx_acc)) {
-                    rx_acc_len = 0; /* 溢出：失步重置 */
+                if (d->rx_acc_len + (size_t)n > sizeof(d->rx_acc)) {
+                    d->rx_acc_len = 0; /* 溢出：失步重置 */
                     break;
                 }
-                memcpy(rx_acc + rx_acc_len, tmp, (size_t)n);
-                rx_acc_len += (size_t)n;
+                memcpy(d->rx_acc + d->rx_acc_len, tmp, (size_t)n);
+                d->rx_acc_len += (size_t)n;
             }
             continue;
         }
@@ -468,7 +456,7 @@ static int dispatch_payload(struct goodix_dev *d, const uint8_t *pl,
             gx_tls_capture_mode(d, 0);   /* 握手期 bio 要自己读 USB */
             int r = gx_tls_reconnect(d);
             gx_tls_capture_mode(d, 1);
-            rx_acc_len = 0;              /* 旧会话聚合数据作废 */
+            d->rx_acc_len = 0;              /* 旧会话聚合数据作废 */
             if (r < 0)
                 return -1;
         }
@@ -506,12 +494,12 @@ static int dispatch_payload(struct goodix_dev *d, const uint8_t *pl,
 static int wait_image(struct goodix_dev *d, uint8_t *img, uint16_t *size,
                       int timeout_ms)
 {
-    static uint8_t pl[3 + 0x6C00];
+    uint8_t *pl = d->rx_scratch;    /* 设备级 payload 工作区 */
     int deadline = timeout_ms > 0 ? timeout_ms : 10000;
     int tls = d->tls_inited && d->tls;
     int img_req = 0;
 
-    rx_acc_len = 0;
+    d->rx_acc_len = 0;
     if (tls)
         gx_tls_capture_mode(d, 1);
     while (deadline > 0) {
@@ -520,8 +508,8 @@ static int wait_image(struct goodix_dev *d, uint8_t *img, uint16_t *size,
                 gx_tls_capture_mode(d, 0);
             return -4;
         }
-        uint16_t plen = sizeof(pl);
-        int r = next_payload(d, pl, &plen, sizeof(pl), 200);
+        uint16_t plen = sizeof(d->rx_scratch);
+        int r = next_payload(d, pl, &plen, sizeof(d->rx_scratch), 200);
         if (r < 0) {
             if (tls)
                 gx_tls_capture_mode(d, 0);
@@ -557,12 +545,12 @@ static int wait_image(struct goodix_dev *d, uint8_t *img, uint16_t *size,
  * 采不到/校验失败重试 3 次。 */
 int gx_fdt_sample_base(struct goodix_dev *d)
 {
-    static uint8_t pl[3 + 0x6C00];
+    uint8_t *pl = d->rx_scratch;    /* 设备级 payload 工作区 */
     int tls = d->tls_inited && d->tls;
 
     if (tls)
         gx_tls_capture_mode(d, 1);
-    rx_acc_len = 0;
+    d->rx_acc_len = 0;
 
     for (int attempt = 0; attempt < 3; attempt++) {
         uint8_t req[14];
@@ -576,8 +564,8 @@ int gx_fdt_sample_base(struct goodix_dev *d)
         }
         int deadline = 1500;
         while (deadline > 0) {
-            uint16_t plen = sizeof(pl);
-            int r = next_payload(d, pl, &plen, sizeof(pl), 200);
+            uint16_t plen = sizeof(d->rx_scratch);
+            int r = next_payload(d, pl, &plen, sizeof(d->rx_scratch), 200);
             if (r <= 0) {
                 deadline -= 200;
                 continue;
@@ -666,12 +654,12 @@ int gx_capture_base_image(struct goodix_dev *d)
  * cmd0=3 分流）。libfprint 驱动用它上报 FP_FINGER_NONE。 */
 int gx_wait_finger_up(struct goodix_dev *d, int timeout_ms)
 {
-    static uint8_t pl[3 + 0x6C00];
+    uint8_t *pl = d->rx_scratch;    /* 设备级 payload 工作区 */
     int deadline = timeout_ms > 0 ? timeout_ms : 10000;
     int tls = d->tls_inited && d->tls;
     int ret = -2;
 
-    rx_acc_len = 0;
+    d->rx_acc_len = 0;
     if (tls)
         gx_tls_capture_mode(d, 1);
     while (deadline > 0) {
@@ -679,8 +667,8 @@ int gx_wait_finger_up(struct goodix_dev *d, int timeout_ms)
             ret = -4;
             break;
         }
-        uint16_t plen = sizeof(pl);
-        int r = next_payload(d, pl, &plen, sizeof(pl), 200);
+        uint16_t plen = sizeof(d->rx_scratch);
+        int r = next_payload(d, pl, &plen, sizeof(d->rx_scratch), 200);
         if (r < 0) {
             ret = -3;
             break;
