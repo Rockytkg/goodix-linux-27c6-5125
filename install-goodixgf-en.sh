@@ -19,7 +19,8 @@
 # Process:
 #   1. Install build dependencies (including opencv4 >= 4.5, doctest) + fprintd
 #   2. Copy goodixgf driver + protocol core to <source>/libfprint/drivers/goodixgf/
-#   3. Patch meson.build (fork's driver_sources / optional_deps, idempotent)
+#   3. Patch meson.build (fork's driver_sources / optional_deps) and apply the
+#      SIGFM matching fixes, idempotent
 #   4. Compile and install to /usr (SONAME unchanged, system fprintd reuses directly)
 #   5. Reload udev, restart fprintd (kept alive via --no-timeout drop-in)
 #
@@ -230,8 +231,15 @@ cp "$GOODIX_LINUX/src/transport.c" \
    "$GOODIX_LINUX/src/goodix_crc.c" \
    "$D/core/"
 cp "$GOODIX_LINUX/include/goodix.h" \
-   "$GOODIX_LINUX/include/goodix_imgproc.h" \
-   "$GOODIX_LINUX/include/goodix_fw.h" "$D/core/"
+   "$GOODIX_LINUX/include/goodix_imgproc.h" "$D/core/"
+# goodix_fw.h (vendor firmware image) is optional: without it the driver only
+# compares the version and never erases or flashes. A copy left in the source
+# tree by an earlier run is removed so it is not picked up.
+if [ -f "$GOODIX_LINUX/include/goodix_fw.h" ]; then
+  cp "$GOODIX_LINUX/include/goodix_fw.h" "$D/core/"
+else
+  rm -f "$D/core/goodix_fw.h"
+fi
 
 # Copied driver files from a Windows checkout may carry CRLF (g-ir-scanner's gtk-doc
 # parser doesn't recognize \r), normalize line endings like the source tree.
@@ -245,8 +253,8 @@ else
   done
 fi
 
-# ---------------- 3. Patch meson (idempotent, anchors match fork's actual structure) ----------------
-echo "==> [3/5] Patching meson.build"
+# ---------------- 3. Patch meson + SIGFM (idempotent, anchors match fork's actual structure) ----------------
+echo "==> [3/5] Patching meson.build and SIGFM"
 python3 - "$SRC" <<'PYEOF'
 import sys
 
@@ -334,7 +342,51 @@ endif"""
                  "please manually add opencv5 fallback to sigfm/meson.build")
     s = s.replace(old, new, 1)
     open(p, 'w').write(s)
-print('patched: optional_deps + driver_sources (goodixgf) + sigfm opencv fallback')
+
+# --- 3d. sigfm/sigfm.cpp: two matching fixes against false accepts ---
+# Proposed upstream on libfprint !530; applied here until the fork has them.
+# 1. match::operator< compared only p1.y, so std::set kept one correspondence
+#    per keypoint row and silently dropped the others.
+# 2. Correspondences displaced by <= 2 px come from the sensor's fixed pattern
+#    (same pixels in every frame, whatever the finger), not from the finger:
+#    without this filter impostor frames scored 2,000-13,000 against a
+#    threshold of 20.
+p = src + '/libfprint/sigfm/sigfm.cpp'
+s = orig = open(p).read()
+old = """        return (this->p1.y < right.p1.y) ||
+               ((this->p1.y < right.p1.y) && this->p1.x < right.p1.x);
+"""
+new = """        return std::tie(p1.y, p1.x, p2.y, p2.x) <
+               std::tie(right.p1.y, right.p1.x, right.p2.y, right.p2.x);
+"""
+s = s.replace(old, new, 1)
+if 'min_displacement' not in s:
+    fixes = [
+        ("constexpr auto min_match = 5;\n",
+         """constexpr auto min_match = 5;
+// Correspondences whose keypoints sit at (almost) the same sensor pixel come
+// from the sensor's fixed pattern, not from the finger: they are dropped.
+constexpr auto min_displacement = 2.0;
+"""),
+        ("""                matches_unique.emplace(
+                    match{frame->keypoints.at(match_1.queryIdx).pt,
+                          enrolled->keypoints.at(match_1.trainIdx).pt});
+""",
+         """                const cv::Point2f& kp1 = frame->keypoints.at(match_1.queryIdx).pt;
+                const cv::Point2f& kp2 = enrolled->keypoints.at(match_1.trainIdx).pt;
+                if (cv::norm(kp1 - kp2) <= min_displacement)
+                    continue;
+                matches_unique.emplace(match{kp1, kp2});
+"""),
+    ]
+    for old, new in fixes:
+        if old not in s:
+            sys.exit("!! Cannot find SIGFM matching anchors in sigfm/sigfm.cpp (fork structure changed?), "
+                     "please apply the two fixes described above step 3d manually")
+        s = s.replace(old, new, 1)
+if s != orig:
+    open(p, 'w').write(s)
+print('patched: optional_deps + driver_sources (goodixgf) + sigfm opencv fallback + sigfm matching fixes')
 PYEOF
 
 # ---------------- 4. Compile and install ----------------

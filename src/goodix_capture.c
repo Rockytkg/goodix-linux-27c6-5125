@@ -334,10 +334,17 @@ static void handle_fdt_frame(struct goodix_dev *d, const uint8_t *p,
         gx_fdt_learn_up_base(d, data + 4, touchflag);
     else if (irq == 0x200)
         gx_fdt_learn_down_base(d, data + 4);
-    /* 事件回调（libfprint 对接：手指按下/抬起状态上报） */
-    if (d->event_cb && (irq == 2 || irq == 0x200))
-        d->event_cb(d, irq == 2 ? GX_EV_FINGER_DOWN : GX_EV_FINGER_UP,
-                    d->event_cb_user);
+    /* 事件回调（libfprint 对接：手指按下/抬起状态上报）。
+     * 2/0x80/0x82 = 手指按下：0x80/0x82 "reverse" 也是真实触碰，必须上报
+     * PRESENT 让 libfprint 进入 CAPTURE 态，否则交付图像时
+     * fpi_image_device_image_captured 的 state==CAPTURE 断言失败（卡死）。
+     * 基线不从 reverse 帧学习（上面只在 2/0x200 学 up/down 表）。 */
+    if (d->event_cb) {
+        if (irq == 2 || irq == 0x80 || irq == 0x82)
+            d->event_cb(d, GX_EV_FINGER_DOWN, d->event_cb_user);
+        else if (irq == 0x200)
+            d->event_cb(d, GX_EV_FINGER_UP, d->event_cb_user);
+    }
 }
 
 void gx_capture_set_event_cb(struct goodix_dev *d,
@@ -474,11 +481,16 @@ static int dispatch_payload(struct goodix_dev *d, const uint8_t *pl,
             /* FDT down 事件 -> 请求取图 ->
              * SetMode Image (cmd0=2 cmd1=0 = 0x20, data=[1,0])，
              * MCU 随即曝光并推 cmd0=2 图像帧 */
-            if (irq == 2 && img_req && !*img_req) {
+            /* irq==2 手指按下；0x80/0x82 "reverse"：基线偏差致真实触碰
+             * 反向极性上报，同样请求取图（坏帧由下游 gx_fdt_check_finger
+             * + 拒绝重布防循环筛除）。修复 enroll 偶发卡死：finger-detect
+             * 上报 0x80 被忽略 -> 不取图 -> "no image frame received"。 */
+            if ((irq == 2 || irq == 0x80 || irq == 0x82) &&
+                img_req && !*img_req) {
                 uint8_t im[2] = { 1, 0 };
                 *img_req = 1;
-                LOG("capture: finger down, request image "
-                    "(SetMode Image 0x20 [1,0])");
+                LOG("capture: finger touch (irq 0x%x), request image "
+                    "(SetMode Image 0x20 [1,0])", irq);
                 gx_send_cmd(d, 0x20, im, 2, 200);
             }
             return 0;
@@ -490,9 +502,13 @@ static int dispatch_payload(struct goodix_dev *d, const uint8_t *pl,
     return 0;
 }
 
-/* 等设备推送 cmd0=2 图像帧（混合通道） */
+/* 等设备推送 cmd0=2 图像帧（混合通道）。
+ * cancellable=0：已发出 SetMode Image、图像正在路上时用——中途放弃会把
+ * 半条 TLS 记录留在通道里，之后所有图像都解不出来（enroll 换阶段时
+ * libfprint deactivate 正好落在这个窗口）。此时读完（~150ms，受 timeout
+ * 限制）再由调用方检查 capture_stop。 */
 static int wait_image(struct goodix_dev *d, uint8_t *img, uint16_t *size,
-                      int timeout_ms)
+                      int timeout_ms, int cancellable)
 {
     uint8_t *pl = d->rx_scratch;    /* 设备级 payload 工作区 */
     int deadline = timeout_ms > 0 ? timeout_ms : 10000;
@@ -503,7 +519,7 @@ static int wait_image(struct goodix_dev *d, uint8_t *img, uint16_t *size,
     if (tls)
         gx_tls_capture_mode(d, 1);
     while (deadline > 0) {
-        if (d->capture_stop) {
+        if (cancellable && d->capture_stop) {
             if (tls)
                 gx_tls_capture_mode(d, 0);
             return -4;
@@ -638,7 +654,7 @@ int gx_capture_base_image(struct goodix_dev *d)
     uint16_t sz = 0;
     LOG("capture base image (SetMode Image 0x20 [1,0], no-finger frame)");
     gx_send_cmd(d, 0x20, im, 2, 200);
-    if (wait_image(d, d->img_base, &sz, 4000) != 0 ||
+    if (wait_image(d, d->img_base, &sz, 4000, 1) != 0 ||
         sz != d->img_size) {
         LOG("base image capture failed (sz=%u)", sz);
         return -1;
@@ -646,6 +662,87 @@ int gx_capture_base_image(struct goodix_dev *d)
     d->img_base_valid = true;
     d->base_dirty = true;
     LOG("base image captured (%u B) - goodix.dat imagebase", sz);
+    return 0;
+}
+
+/* 是否在每次布防前采新鲜无手指帧：默认开启（GOODIX_IMGPROC_FRESH_BASE=0
+ * 关闭；标定 dump 模式下总是采集以便离线对比） */
+static int fresh_wanted(const struct goodix_dev *d)
+{
+    const char *e = getenv("GOODIX_IMGPROC_FRESH_BASE");
+    if (d->fresh_broken)
+        return 0;
+    return getenv("GOODIX_DUMP_IMGPROC") != NULL || !e || atoi(e) != 0;
+}
+
+int gx_capture_fresh_image(struct goodix_dev *d)
+{
+    uint8_t im[2] = { 1, 0 };
+    uint16_t sz = 0;
+    uint8_t *tmp;
+    void (*cb)(struct goodix_dev *, int, void *) = d->event_cb;
+    const char *e = getenv("GOODIX_FRESH_MAXDC");
+    double maxdc = e && *e ? atof(e) : 300.0;
+    const char *er = getenv("GOODIX_FRESH_MAXRIDGE");
+    double maxridge = er && *er ? atof(er) : 12.0;
+    const uint8_t *ref;
+    double dc = 0.0;
+    int r;
+
+    tmp = malloc(GF_IMG_MAX);
+    if (!tmp)
+        return -1;
+    /* 刚抬起的手指留一点离开时间；期间不向 libfprint 上报手指事件 */
+    usleep(100000);
+    if (d->capture_stop) {          /* 尚未发命令，可直接放弃 */
+        free(tmp);
+        return -4;
+    }
+    d->event_cb = NULL;
+    gx_send_cmd(d, 0x20, im, 2, 200);
+    r = wait_image(d, tmp, &sz, 2000, 0);
+    d->event_cb = cb;
+    if (r != 0 || sz != d->img_size) {
+        free(tmp);
+        /* 超时/失败：图像请求可能仍挂在 MCU 上，再叠一个请求会卡死后续
+         * 取图——本次 open 内停用新鲜帧。 */
+        d->fresh_broken = true;
+        LOG("fresh no-finger frame failed (%d, sz=%u) - disabled for this "
+            "session, using stored base", r, sz);
+        return -1;
+    }
+    gx_imgproc_dump16(d, "pre16", tmp);
+    /* 合理性检查：与上一可信新鲜帧（跟踪漂移）或存档基线比较整体压低量。
+     * 手指在上时压低 ~1000+ 计数；被拒时保留上一可信新鲜帧不动（按住
+     * 手指连续重试时基线仍是几秒前的）。 */
+    ref = d->img_fresh_valid ? d->img_fresh : d->img_base_valid ? d->img_base : NULL;
+    if (ref) {
+        uint32_t npix = (uint32_t)d->img_w * d->img_h;
+        for (uint32_t i = 0; i < npix; i++)
+            dc += (double)px16(tmp, i) - (double)px16(ref, i);
+        dc /= npix;
+    }
+    if (ref && (dc > maxdc || dc < -maxdc)) {
+        /* 尚无可信新鲜帧时，存档基线本身可能已严重漂移：没有脊谷结构
+         * （带通对比度低）说明只是漂移而非手指，仍可采用。 */
+        struct gx_imgproc_params p = GX_IMGPROC_SIGFM_PARAMS;
+        struct gx_imgproc_signal sig = { 0 };
+        p.fresh_base = 0;
+        if (d->img_fresh_valid || gx_imgproc_signal(d, &p, tmp, &sig) != 0 ||
+            sig.ridge >= maxridge) {
+            LOG("fresh no-finger frame rejected: dc=%.0f ridge=%.1f vs %s "
+                "(finger on sensor?)", dc, sig.ridge,
+                d->img_fresh_valid ? "last fresh" : "stored base");
+            free(tmp);
+            return 1;
+        }
+        LOG("fresh no-finger frame: stored base drifted (dc=%.0f) but no "
+            "ridge structure (%.1f), accepted", dc, sig.ridge);
+    }
+    memcpy(d->img_fresh, tmp, sz);
+    d->img_fresh_valid = true;
+    LOG("fresh no-finger frame ok (dc=%.0f)", dc);
+    free(tmp);
     return 0;
 }
 
@@ -757,6 +854,10 @@ int gx_capture(struct goodix_dev *d, uint8_t *img, uint16_t *size)
         LOG("capture: SetMode Image (0x20 [1,0]) - direct exposure");
         gx_send_cmd(d, 0x20, im, 2, 200);
     } else {
+        /* 新鲜无手指帧：紧邻手指帧的基线（标定 dump / FRESH_BASE 模式） */
+        if (fresh_wanted(d) &&
+            (gx_capture_fresh_image(d) == -4 || d->capture_stop))
+            return -4;
         arm_fdt_down(d);
     }
 
@@ -774,7 +875,7 @@ int gx_capture(struct goodix_dev *d, uint8_t *img, uint16_t *size)
         int direct = getenv("GOODIX_CAPTURE_IMAGE_MODE") != NULL;
         int rejects = 0;
         for (;;) {
-            r = wait_image(d, img, size, 10000);
+            r = wait_image(d, img, size, 10000, 1);
             if (r != 0)
                 break;
             if (direct || !d->img_base_valid)

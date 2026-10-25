@@ -19,7 +19,8 @@
 # 流程：
 #   1. 安装构建依赖（含 opencv4 >= 4.5、doctest）+ fprintd
 #   2. 把 goodixgf 驱动 + 协议核心复制进 <源码>/libfprint/drivers/goodixgf/
-#   3. patch meson.build（fork 的 driver_sources / optional_deps，幂等）
+#   3. patch meson.build（fork 的 driver_sources / optional_deps）并应用 SIGFM
+#      匹配修复，幂等
 #   4. 编译安装到 /usr（SONAME 不变，系统 fprintd 直接复用）
 #   5. 重载 udev、重启 fprintd
 #
@@ -225,8 +226,14 @@ cp "$GOODIX_LINUX/src/transport.c" \
    "$GOODIX_LINUX/src/goodix_crc.c" \
    "$D/core/"
 cp "$GOODIX_LINUX/include/goodix.h" \
-   "$GOODIX_LINUX/include/goodix_imgproc.h" \
-   "$GOODIX_LINUX/include/goodix_fw.h" "$D/core/"
+   "$GOODIX_LINUX/include/goodix_imgproc.h" "$D/core/"
+# goodix_fw.h（厂商固件镜像）可选：没有时驱动只比较版本，绝不擦除或烧写。
+# 同时删除上次运行留在源码树里的旧副本，避免被沿用。
+if [ -f "$GOODIX_LINUX/include/goodix_fw.h" ]; then
+  cp "$GOODIX_LINUX/include/goodix_fw.h" "$D/core/"
+else
+  rm -f "$D/core/goodix_fw.h"
+fi
 
 # 复制的驱动文件若来自 Windows checkout 可能带 CRLF（g-ir-scanner 的 gtk-doc
 # 解析器不认 \r），与源码树同样做行尾规范化。
@@ -240,8 +247,8 @@ else
   done
 fi
 
-# ---------------- 3. patch meson（幂等，锚点对应该 fork 的实际结构） ----------------
-echo "==> [3/5] patch meson.build"
+# ---------------- 3. patch meson 与 SIGFM（幂等，锚点对应该 fork 的实际结构） ----------------
+echo "==> [3/5] patch meson.build 与 SIGFM"
 python3 - "$SRC" <<'PYEOF'
 import sys
 
@@ -327,7 +334,49 @@ endif"""
                  "请手动在 sigfm/meson.build 中加 opencv5 回退")
     s = s.replace(old, new, 1)
     open(p, 'w').write(s)
-print('patched: optional_deps + driver_sources (goodixgf) + sigfm opencv fallback')
+
+# --- 3d. sigfm/sigfm.cpp：两处匹配修复（防止冒认） ---
+# 已向上游 libfprint !530 提交；fork 合入之前在此应用。
+# 1. match::operator< 只比较 p1.y，std::set 每一行关键点只保留一个对应，
+#    其余被静默丢弃。
+# 2. 位移 <= 2px 的对应来自传感器固定图案（每帧同一像素，与手指无关），
+#    而不是手指：不过滤时冒认帧得分 2000-13000，阈值仅 20。
+p = src + '/libfprint/sigfm/sigfm.cpp'
+s = orig = open(p).read()
+old = """        return (this->p1.y < right.p1.y) ||
+               ((this->p1.y < right.p1.y) && this->p1.x < right.p1.x);
+"""
+new = """        return std::tie(p1.y, p1.x, p2.y, p2.x) <
+               std::tie(right.p1.y, right.p1.x, right.p2.y, right.p2.x);
+"""
+s = s.replace(old, new, 1)
+if 'min_displacement' not in s:
+    fixes = [
+        ("constexpr auto min_match = 5;\n",
+         """constexpr auto min_match = 5;
+// Correspondences whose keypoints sit at (almost) the same sensor pixel come
+// from the sensor's fixed pattern, not from the finger: they are dropped.
+constexpr auto min_displacement = 2.0;
+"""),
+        ("""                matches_unique.emplace(
+                    match{frame->keypoints.at(match_1.queryIdx).pt,
+                          enrolled->keypoints.at(match_1.trainIdx).pt});
+""",
+         """                const cv::Point2f& kp1 = frame->keypoints.at(match_1.queryIdx).pt;
+                const cv::Point2f& kp2 = enrolled->keypoints.at(match_1.trainIdx).pt;
+                if (cv::norm(kp1 - kp2) <= min_displacement)
+                    continue;
+                matches_unique.emplace(match{kp1, kp2});
+"""),
+    ]
+    for old, new in fixes:
+        if old not in s:
+            sys.exit("!! sigfm/sigfm.cpp 中找不到 SIGFM 匹配锚点（fork 结构变化？），"
+                     "请按 3d 步骤上方说明手动应用这两处修复")
+        s = s.replace(old, new, 1)
+if s != orig:
+    open(p, 'w').write(s)
+print('patched: optional_deps + driver_sources (goodixgf) + sigfm opencv fallback + sigfm matching fixes')
 PYEOF
 
 # ---------------- 4. 编译安装 ----------------

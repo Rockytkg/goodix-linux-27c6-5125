@@ -33,7 +33,7 @@ goodix-cli: $(OBJS)
 %.o: %.c include/goodix.h include/goodix_imgproc.h
 	$(CC) $(CFLAGS) -c -o $@ $<
 
-src/goodix_fwupdate.o: src/goodix_fwupdate.c include/goodix_fw.h
+src/goodix_fwupdate.o: src/goodix_fwupdate.c $(wildcard include/goodix_fw.h)
 	$(CC) $(CFLAGS) -c -o $@ $<
 
 clean:

@@ -173,6 +173,13 @@ struct goodix_dev {
     uint8_t img_base[GF_IMG_MAX];
     bool img_base_valid;    /* 基线图像可用（文件加载或 init 采样成功） */
 
+    /* 新鲜无手指帧：布防 FDT down 前直接曝光采一帧（默认开启，
+     * GOODIX_IMGPROC_FRESH_BASE=0 关闭），与手指帧时间上紧邻，消除基线
+     * 漂移。通过合理性检查（相对 img_base 的整体压低量不像手指）才置 valid。 */
+    uint8_t img_fresh[GF_IMG_MAX];
+    bool img_fresh_valid;
+    bool fresh_broken;      /* 本次 open 内新鲜帧超时过：不再请求，回退存档基线 */
+
     /* TLS 解密数据聚合缓冲（goodix_capture.c 的混合通道：B0 帧解密后的
      * 字节流先攒出完整 payload 再分流）。放设备结构里而不是文件级 static，
      * 保证多设备实例/重入安全。 */
@@ -274,6 +281,12 @@ int gx_fdt_sample_base(struct goodix_dev *d);
  * 存入 d->img_base（不进 FDT 判别循环）。
  * 成功返回 0 且 d->img_base_valid=true。 */
 int gx_capture_base_image(struct goodix_dev *d);
+/* 新鲜无手指帧：同上直接曝光，存入 d->img_fresh（不动 img_base/goodix.dat）。
+ * 采集期间屏蔽事件回调。相对上一可信新鲜帧（无则存档基线）的整体压低量
+ * 超过 GOODIX_FRESH_MAXDC（默认 300 计数，满按手指 ~1200）视为手指在上并
+ * 丢弃，保留上一可信新鲜帧；尚无新鲜帧时若带通对比度 < GOODIX_FRESH_MAXRIDGE
+ * （默认 12）则判为存档基线漂移而采用。返回 0=采用，1=丢弃，<0 失败。 */
+int gx_capture_fresh_image(struct goodix_dev *d);
 /* 主机侧手指判别——新帧与无手指基线图像做分块统计比较。
  * img 为解包后的 16bit LE 帧（w*h*2 字节）。
  * 返回：1=手指按下（接受），2=空触发，3=坏帧，

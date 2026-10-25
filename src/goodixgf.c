@@ -53,13 +53,22 @@
  *   可采，采满 GF_ENROLL_MIN_STAGES 后即以当前帧为收尾帧提前完成。
  *   下限保证基本覆盖，上限封顶避免无休止采集（基类 nr_enroll_stages 的
  *   初值设为 GF_ENROLL_MAX_STAGES，收敛后运行期下调）。 */
-#define GF_ENROLL_MIN_STAGES  3
-#define GF_ENROLL_MAX_STAGES  8
-#define GF_ENROLL_DUP_STOP    2
+/* 覆盖容量：80x64@500DPI 单帧 ~4.1x3.25mm，指腹压区 ~12x14mm，50% 重叠
+ * 需 ~30-60 块才能覆盖主压区（经验值 60-120 帧亦吻合）。原值 8 帧结构性
+ * 不足 -> 只有命中已采区才匹配。上调模板容量，依赖多样性检查
+ * (GF_ENROLL_MIN_DIFF) 驱动用户逐步铺满；DUP_STOP 提高避免过早收敛。 */
+#define GF_ENROLL_MIN_STAGES  15
+#define GF_ENROLL_MAX_STAGES  30
+#define GF_ENROLL_DUP_STOP    4
 #define GF_ENROLL_NPIX   (GOODIXGF_IMG_W * GOODIXGF_IMG_H)
 /* enroll 多样性阈值：两帧 8bit 图像的平均绝对差低于该值即判为"同一位置
  * 重复按压"（SIFT 关键点几乎一致）。可经 GOODIX_ENROLL_MIN_DIFF 覆盖。 */
 #define GF_ENROLL_MIN_DIFF  8.0
+/* 帧质量门限：DoG 带通后 (raw - base) 的标准差（12bit 计数，见
+ * gx_imgproc_signal）。实测满按 ~110-175、空帧/悬空 ~2-5；低于门限的
+ * 帧几乎没有脊谷对比度，交给 SIGFM 只会匹配到传感器残影，按"重试"处理
+ * 而不注册/比对。可经 GOODIX_MIN_RIDGE 覆盖（0 关闭）。 */
+#define GF_MIN_RIDGE  10.0
 
 struct _FpiDeviceGoodixGF
 {
@@ -73,7 +82,9 @@ struct _FpiDeviceGoodixGF
    * 之后仅在采集 worker 线程访问。 */
   gboolean          enroll;            /* 当前会话是否为 enroll */
   int               accepted_count;    /* 已接受的 enroll 帧数 */
-  uint8_t           accepted[GF_ENROLL_MAX_STAGES][GF_ENROLL_NPIX]; /* 已接受帧 */
+  uint8_t         (*accepted)[GF_ENROLL_NPIX]; /* 已接受帧：enroll 时堆分配
+                                                * MAX_STAGES 块（内联会超 GObject
+                                                * 实例 64KB 上限）。 */
   gboolean          enroll_converged;  /* 空间覆盖已收敛，交付收尾帧直到完成 */
   int               dup_streak;        /* 连续位置重复按压次数 */
 };
@@ -271,6 +282,28 @@ gf_capture_worker (gpointer user_data)
            * 修改任何图像参数后必须 fprintd-delete 重新 enroll。 */
           gx_imgproc_apply_env (&p);
           gx_imgproc_to8bit (gx, &p, img, fimg->data);
+
+          /* 质量门限：脊谷对比度过低（空触发/轻触/悬空）按重试处理 */
+          {
+            struct gx_imgproc_signal sig;
+            const gchar *e = g_getenv ("GOODIX_MIN_RIDGE");
+            gdouble min_ridge = e && *e ? g_ascii_strtod (e, NULL) : GF_MIN_RIDGE;
+
+            if (gx_imgproc_signal (gx, &p, img, &sig) == 0)
+              {
+                fp_info ("frame signal dc=%.0f ridge=%.1f", sig.dc, sig.ridge);
+                if (sig.ridge < min_ridge)
+                  {
+                    fp_warn ("frame too weak (ridge %.1f < %.1f) - "
+                             "place the finger flat and try again",
+                             sig.ridge, min_ridge);
+                    gf_post (self, gf_on_retry_scan, NULL, NULL, FALSE);
+                    g_object_unref (fimg);
+                    gx_wait_finger_up (gx, 15000);
+                    continue;
+                  }
+              }
+          }
           /* 这是一个完整的按压帧。SIGFM 使用对尺度/旋转不敏感的 SIFT
            * 关键点；保持 FPI_IMAGE_PARTIAL 不设置，因为设置后会被裁剪
            * 边缘特征。 */
@@ -463,6 +496,11 @@ gf_activate (FpImageDevice *dev)
   self->accepted_count = 0;
   self->dup_streak = 0;
   self->enroll_converged = FALSE;
+  /* 多样性检查用的已接受帧缓冲放堆上（MAX_STAGES x NPIX 会超 GObject 实例
+   * 64KB 上限）；仅 enroll 会话需要。 */
+  g_clear_pointer (&self->accepted, g_free);
+  if (self->enroll)
+    self->accepted = g_malloc0 ((gsize) GF_ENROLL_MAX_STAGES * GF_ENROLL_NPIX);
   /* nr_enroll_stages 是实例字段，可能在上次 enroll 收敛时被运行期下调，
    * 每次会话开始复位到上限，保证动态采样有完整的收敛空间。gf_activate
    * 运行于主上下文，此处调用 setter 安全。 */
@@ -481,6 +519,7 @@ gf_deactivate (FpImageDevice *dev)
   if (self->gx)
     gx_capture_cancel (self->gx);
   g_clear_pointer (&self->worker, g_thread_join);
+  g_clear_pointer (&self->accepted, g_free);
   fpi_image_device_deactivate_complete (dev, NULL);
 }
 

@@ -257,6 +257,303 @@ static void stage_enhance(const uint8_t *in, uint8_t *out,
     free(blur);
 }
 
+/* ================= GX_IMGPROC_MODE_RIDGE =================
+ * 背景：本传感器的 (raw - base) 除了脊谷信号外还带一个固定于像素网格的
+ * 残影（逐像素/逐列增益 x 手指整体压低量，及基线漂移），弱按压时它在
+ * 百分位拉伸后占满整幅图，SIFT 关键点全落在残影上 -> 不同手指互相匹配。
+ * 本管线全程浮点（不做 4095 截断），用 DoG 带通只保留脊距频段
+ * （σ1≈1 去像素噪声，σ2≈4 去残影/压力的低频分量），可选按基线形状回归
+ * 去除增益残影，再拉伸 + CLAHE 均衡局部对比度。参数与离线标定
+ * （tools/fp_tune）的 OpenCV/numpy 参考实现一致：高斯核长 round(8σ+1)|1、
+ * 边界 reflect-101、百分位线性插值、CLAHE 同 OpenCV 算法。 */
+
+static const uint8_t *select_base(const struct goodix_dev *d,
+                                  const struct gx_imgproc_params *p)
+{
+    if (p->fresh_base && d->img_fresh_valid)
+        return d->img_fresh;
+    return d->img_base_valid ? d->img_base : NULL;
+}
+
+/* reflect-101 边界索引（OpenCV BORDER_DEFAULT），要求 |越界| < n */
+static inline int reflect101(int i, int n)
+{
+    if (i < 0)
+        return -i;
+    if (i >= n)
+        return 2 * n - 2 - i;
+    return i;
+}
+
+/* 可分离高斯（浮点），核同 cv::getGaussianKernel(round(8σ+1)|1, σ)。
+ * 返回 0 成功、-1 分配失败（out 保持不变）。 */
+static int gauss_f(const float *in, float *out, int w, int h, float sigma)
+{
+    int ks = ((int)lroundf(sigma * 8.0f + 1.0f)) | 1;
+    int r = ks / 2;
+    float *k, *tmp;
+    float ksum = 0.0f;
+
+    if (r >= w || r >= h)
+        r = (w < h ? w : h) - 1;
+    ks = 2 * r + 1;
+    k = malloc((size_t)ks * sizeof(float));
+    tmp = malloc((size_t)w * h * sizeof(float));
+    if (!k || !tmp) {
+        free(k);
+        free(tmp);
+        return -1;
+    }
+    for (int i = 0; i < ks; i++) {
+        float t = (float)(i - r);
+        k[i] = expf(-(t * t) / (2.0f * sigma * sigma));
+        ksum += k[i];
+    }
+    for (int i = 0; i < ks; i++)
+        k[i] /= ksum;
+    for (int y = 0; y < h; y++)
+        for (int x = 0; x < w; x++) {
+            float acc = 0.0f;
+            for (int j = -r; j <= r; j++)
+                acc += k[j + r] * in[y * w + reflect101(x + j, w)];
+            tmp[y * w + x] = acc;
+        }
+    for (int y = 0; y < h; y++)
+        for (int x = 0; x < w; x++) {
+            float acc = 0.0f;
+            for (int j = -r; j <= r; j++)
+                acc += k[j + r] * tmp[reflect101(y + j, h) * w + x];
+            out[y * w + x] = acc;
+        }
+    free(k);
+    free(tmp);
+    return 0;
+}
+
+/* d = raw - base（浮点）；deghost 时减去 d 在 (base - mean(base)) 上的
+ * 最小二乘投影：增益残影与基线逐像素形状同源（手指整体压低量 x 增益）。 */
+static void ridge_diff(const uint8_t *img16, const uint8_t *base,
+                       uint32_t npix, int deghost, float *dst)
+{
+    double bmean = 0.0, num = 0.0, den = 0.0, dmean = 0.0;
+
+    for (uint32_t i = 0; i < npix; i++) {
+        dst[i] = (float)imgproc_px16(img16, i) - (float)imgproc_px16(base, i);
+        dmean += dst[i];
+        bmean += imgproc_px16(base, i);
+    }
+    if (!deghost)
+        return;
+    dmean /= npix;
+    bmean /= npix;
+    for (uint32_t i = 0; i < npix; i++) {
+        double rb = imgproc_px16(base, i) - bmean;
+        num += (dst[i] - dmean) * rb;
+        den += rb * rb;
+    }
+    if (den <= 0.0)
+        return;
+    for (uint32_t i = 0; i < npix; i++)
+        dst[i] -= (float)(num / den * (imgproc_px16(base, i) - bmean));
+}
+
+/* DoG 带通：dst = G(σ1) - G(σ2)，原地可用（dst == src）。 */
+static int ridge_dog(const float *src, float *dst, int w, int h,
+                     float s1, float s2)
+{
+    uint32_t npix = (uint32_t)w * h;
+    float *g1 = malloc(npix * sizeof(float));
+    float *g2 = malloc(npix * sizeof(float));
+    int r = -1;
+
+    if (g1 && g2 && gauss_f(src, g1, w, h, s1) == 0 &&
+        gauss_f(src, g2, w, h, s2) == 0) {
+        for (uint32_t i = 0; i < npix; i++)
+            dst[i] = g1[i] - g2[i];
+        r = 0;
+    }
+    free(g1);
+    free(g2);
+    return r;
+}
+
+static int cmp_float(const void *a, const void *b)
+{
+    float x = *(const float *)a, y = *(const float *)b;
+    return (x > y) - (x < y);
+}
+
+/* numpy.percentile（linear）于已排序数组 */
+static float pct_sorted(const float *v, uint32_t n, float q)
+{
+    float pos = (float)(n - 1) * q / 100.0f;
+    uint32_t i = (uint32_t)pos;
+    float fr = pos - (float)i;
+    if (i + 1 >= n)
+        return v[n - 1];
+    return v[i] + fr * (v[i + 1] - v[i]);
+}
+
+/* 百分位拉伸到 0..255（截断取整，同 numpy astype(uint8)） */
+static int ridge_stretch(const float *src, uint8_t *out8, uint32_t npix,
+                         uint8_t pct_lo, uint8_t pct_hi)
+{
+    float *s = malloc(npix * sizeof(float));
+    float lo, hi, sc;
+
+    if (!s)
+        return -1;
+    memcpy(s, src, npix * sizeof(float));
+    qsort(s, npix, sizeof(float), cmp_float);
+    lo = pct_sorted(s, npix, pct_lo);
+    hi = pct_sorted(s, npix, pct_hi);
+    free(s);
+    if (hi - lo < 1e-3f)
+        hi = lo + 1e-3f;
+    sc = 255.0f / (hi - lo);
+    for (uint32_t i = 0; i < npix; i++) {
+        float v = (src[i] - lo) * sc;
+        out8[i] = (uint8_t)(v <= 0.0f ? 0 : v >= 255.0f ? 255 : (int)v);
+    }
+    return 0;
+}
+
+/* CLAHE（OpenCV 算法：分块直方图裁剪+均匀再分配、LUT、双线性插值）。
+ * 要求 w、h 可被 tiles 整除（80x64 / 4 成立），否则不处理。原地。 */
+static void ridge_clahe(uint8_t *img, int w, int h, float clip, int tiles)
+{
+    int tw, th, total, limit;
+    float lut_scale, inv_tw, inv_th;
+    uint8_t *lut;
+
+    if (clip <= 0.0f || tiles < 1 || w % tiles || h % tiles)
+        return;
+    tw = w / tiles;
+    th = h / tiles;
+    total = tw * th;
+    lut_scale = 255.0f / (float)total;
+    limit = (int)(clip * total / 256);
+    if (limit < 1)
+        limit = 1;
+    lut = malloc((size_t)tiles * tiles * 256);
+    if (!lut)
+        return;
+    for (int ty = 0; ty < tiles; ty++)
+        for (int tx = 0; tx < tiles; tx++) {
+            int hist[256] = { 0 };
+            int clipped = 0, batch, residual, sum = 0;
+            uint8_t *l = &lut[(ty * tiles + tx) * 256];
+
+            for (int y = ty * th; y < (ty + 1) * th; y++)
+                for (int x = tx * tw; x < (tx + 1) * tw; x++)
+                    hist[img[y * w + x]]++;
+            for (int i = 0; i < 256; i++)
+                if (hist[i] > limit) {
+                    clipped += hist[i] - limit;
+                    hist[i] = limit;
+                }
+            batch = clipped / 256;
+            residual = clipped - batch * 256;
+            for (int i = 0; i < 256; i++)
+                hist[i] += batch;
+            if (residual) {
+                int step = 256 / residual > 1 ? 256 / residual : 1;
+                for (int i = 0; i < 256 && residual > 0; i += step, residual--)
+                    hist[i]++;
+            }
+            for (int i = 0; i < 256; i++) {
+                int v;
+                sum += hist[i];
+                v = (int)lrintf((float)sum * lut_scale);
+                l[i] = (uint8_t)(v > 255 ? 255 : v);
+            }
+        }
+    inv_tw = 1.0f / (float)tw;
+    inv_th = 1.0f / (float)th;
+    for (int y = 0; y < h; y++) {
+        float tyf = (float)y * inv_th - 0.5f;
+        int ty1 = (int)floorf(tyf), ty2 = ty1 + 1;
+        float ya = tyf - (float)ty1;
+        ty1 = ty1 < 0 ? 0 : ty1;
+        ty2 = ty2 > tiles - 1 ? tiles - 1 : ty2;
+        for (int x = 0; x < w; x++) {
+            float txf = (float)x * inv_tw - 0.5f;
+            int tx1 = (int)floorf(txf), tx2 = tx1 + 1;
+            float xa = txf - (float)tx1;
+            uint8_t s = img[y * w + x];
+            float res;
+            int v;
+            tx1 = tx1 < 0 ? 0 : tx1;
+            tx2 = tx2 > tiles - 1 ? tiles - 1 : tx2;
+            res = ((float)lut[(ty1 * tiles + tx1) * 256 + s] * (1.0f - xa) +
+                   (float)lut[(ty1 * tiles + tx2) * 256 + s] * xa) * (1.0f - ya) +
+                  ((float)lut[(ty2 * tiles + tx1) * 256 + s] * (1.0f - xa) +
+                   (float)lut[(ty2 * tiles + tx2) * 256 + s] * xa) * ya;
+            v = (int)lrintf(res);
+            img[y * w + x] = (uint8_t)(v < 0 ? 0 : v > 255 ? 255 : v);
+        }
+    }
+    free(lut);
+}
+
+int gx_imgproc_signal(const struct goodix_dev *d,
+                      const struct gx_imgproc_params *p,
+                      const uint8_t *img16, struct gx_imgproc_signal *out)
+{
+    const uint8_t *base = select_base(d, p);
+    uint32_t npix = (uint32_t)d->img_w * d->img_h;
+    float *buf;
+    double s = 0.0, s2 = 0.0;
+
+    if (!base || !npix || !out)
+        return -1;
+    buf = malloc(npix * sizeof(float));
+    if (!buf)
+        return -1;
+    ridge_diff(img16, base, npix, 0, buf);
+    for (uint32_t i = 0; i < npix; i++)
+        s += buf[i];
+    out->dc = (float)(s / npix);
+    if (ridge_dog(buf, buf, d->img_w, d->img_h, p->dog_s1, p->dog_s2) != 0) {
+        free(buf);
+        return -1;
+    }
+    s = 0.0;
+    for (uint32_t i = 0; i < npix; i++) {
+        s += buf[i];
+        s2 += (double)buf[i] * buf[i];
+    }
+    s /= npix;
+    out->ridge = (float)sqrt(s2 / npix - s * s);
+    free(buf);
+    return 0;
+}
+
+/* RIDGE 管线主体。返回 0 成功；-1 无基线/分配失败（调用方回退 legacy）。 */
+static int ridge_to8bit(const struct goodix_dev *d,
+                        const struct gx_imgproc_params *p,
+                        const uint8_t *img16, uint8_t *out8)
+{
+    const uint8_t *base = select_base(d, p);
+    uint32_t npix = (uint32_t)d->img_w * d->img_h;
+    float *buf;
+    int r = -1;
+
+    if (!base)
+        return -1;
+    buf = malloc(npix * sizeof(float));
+    if (!buf)
+        return -1;
+    ridge_diff(img16, base, npix, p->deghost, buf);
+    if (ridge_dog(buf, buf, d->img_w, d->img_h, p->dog_s1, p->dog_s2) == 0 &&
+        ridge_stretch(buf, out8, npix, p->pct_lo, p->pct_hi) == 0) {
+        ridge_clahe(out8, d->img_w, d->img_h, p->clahe_clip, p->clahe_tiles);
+        r = 0;
+    }
+    free(buf);
+    return r;
+}
+
 /* ---- 逐级调试 dump（GOODIX_DUMP_IMGPROC=1）----
  * 序号用 static 计数器：仅调试路径使用，非线程安全可接受。 */
 static uint32_t imgproc_seq;
@@ -303,6 +600,37 @@ static void dump_pgm16le(const char *stage, uint32_t seq,
     free(tmp);
 }
 
+/* 16bit 原样 dump：PGM P5 maxval 4095，像素大端（PGM 规范） */
+static void dump_pgm16raw(const char *stage, uint32_t seq,
+                          uint32_t w, uint32_t h, const uint8_t *img16le)
+{
+    char path[512];
+    FILE *f;
+
+    gx_state_dir_ensure();
+    snprintf(path, sizeof(path), "%s/imgproc-%06u-%s.pgm",
+             gx_state_dir(), seq, stage);
+    f = fopen(path, "wb");
+    if (!f)
+        return;
+    fprintf(f, "P5\n%u %u\n%u\n", w, h, IMGPROC_PX_MAX);
+    for (uint32_t i = 0; i < w * h; i++) {
+        uint16_t v = imgproc_px16(img16le, i);
+        fputc(v >> 8, f);
+        fputc(v & 0xFF, f);
+    }
+    fclose(f);
+}
+
+void gx_imgproc_dump16(const struct goodix_dev *d, const char *stage,
+                       const uint8_t *img16)
+{
+    if (!d || !img16 || !getenv("GOODIX_DUMP_IMGPROC"))
+        return;
+    dump_pgm16raw(stage, imgproc_seq, d->img_w, d->img_h, img16);
+    LOG("imgproc: dumped %s (seq %u)", stage, imgproc_seq);
+}
+
 /* ---- 公共入口 ---- */
 int gx_imgproc_to8bit(const struct goodix_dev *d,
                       const struct gx_imgproc_params *p,
@@ -327,6 +655,27 @@ int gx_imgproc_to8bit(const struct goodix_dev *d,
     memset(hist, 0, sizeof(hist));
 
     do_dump = getenv("GOODIX_DUMP_IMGPROC") != NULL;
+
+    /* 标定：16bit 原帧 + 两种基线原样落盘，离线可复现任意管线 */
+    if (do_dump) {
+        struct gx_imgproc_signal sig;
+        dump_pgm16raw("raw16", imgproc_seq, w, h, img16);
+        if (d->img_base_valid)
+            dump_pgm16raw("base16", imgproc_seq, w, h, d->img_base);
+        if (d->img_fresh_valid)
+            dump_pgm16raw("fresh16", imgproc_seq, w, h, d->img_fresh);
+        if (gx_imgproc_signal(d, p, img16, &sig) == 0)
+            LOG("imgproc: seq %u signal dc=%.0f ridge=%.1f (%s base)",
+                imgproc_seq, sig.dc, sig.ridge,
+                p->fresh_base && d->img_fresh_valid ? "fresh" : "stored");
+    }
+
+    if (p->mode == GX_IMGPROC_MODE_RIDGE && ridge_to8bit(d, p, img16, out8) == 0) {
+        if (do_dump)
+            dump_pgm_u8("ridge8", imgproc_seq, w, h, out8);
+        imgproc_seq++;
+        return 0;
+    }
 
     buf = malloc((size_t)npix * sizeof(uint16_t));
     if (!buf)
@@ -413,5 +762,41 @@ void gx_imgproc_apply_env(struct gx_imgproc_params *p)
         float f = (float)atof(e);
         if (f > 0.0f)
             p->enhance_sigma = f;
+    }
+    if ((e = getenv("GOODIX_IMGPROC_MODE"))) {
+        if (!strcmp(e, "ridge"))
+            p->mode = GX_IMGPROC_MODE_RIDGE;
+        else if (!strcmp(e, "legacy"))
+            p->mode = GX_IMGPROC_MODE_LEGACY;
+    }
+    if ((e = getenv("GOODIX_IMGPROC_FRESH_BASE"))) {
+        v = atoi(e);
+        if (v == 0 || v == 1)
+            p->fresh_base = (uint8_t)v;
+    }
+    if ((e = getenv("GOODIX_IMGPROC_DEGHOST"))) {
+        v = atoi(e);
+        if (v == 0 || v == 1)
+            p->deghost = (uint8_t)v;
+    }
+    if ((e = getenv("GOODIX_IMGPROC_DOG_S1"))) {
+        float f = (float)atof(e);
+        if (f > 0.0f)
+            p->dog_s1 = f;
+    }
+    if ((e = getenv("GOODIX_IMGPROC_DOG_S2"))) {
+        float f = (float)atof(e);
+        if (f > 0.0f)
+            p->dog_s2 = f;
+    }
+    if ((e = getenv("GOODIX_IMGPROC_CLAHE"))) {
+        float f = (float)atof(e);
+        if (f >= 0.0f)
+            p->clahe_clip = f;
+    }
+    if ((e = getenv("GOODIX_IMGPROC_CLAHE_TILES"))) {
+        v = atoi(e);
+        if (v > 0 && v <= 16)
+            p->clahe_tiles = (uint8_t)v;
     }
 }

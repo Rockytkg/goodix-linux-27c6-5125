@@ -26,8 +26,19 @@
 #include <string.h>
 #include <unistd.h>
 #include "goodix.h"
-#include "goodix_fw.h"
 
+/* 厂商固件镜像不随发行包分发（版权归 Goodix，不属于开源许可）。
+ * 有 goodix_fw.h 时保留完整的烧写路径；没有时只做版本比较，绝不擦除或
+ * 烧写 APP（没有镜像时擦除 = 变砖）。 */
+#if __has_include("goodix_fw.h")
+#include "goodix_fw.h"
+#define GX_HAVE_BUNDLED_FW 1
+#else
+#define GF_FW_VERSION "GF_ST411SEC_APP_12508"
+#define GX_HAVE_BUNDLED_FW 0
+#endif
+
+#if GX_HAVE_BUNDLED_FW
 #define FW_SLICE 1008
 
 /* ---- 传输一个分片：0xF0 {off32le, len32le, data} ---- */
@@ -134,6 +145,8 @@ static int fw_clear_app(struct goodix_dev *d)
     return gx_send_cmd_wait(d, GF_CMD_CLEAR_APP, data, 2, rsp, &rl, 500);
 }
 
+#endif /* GX_HAVE_BUNDLED_FW */
+
 /* 固件更新主流程。
  * now_version：64B 的 EVK 版本字符串。
  * 返回 1 = 无需更新；FW_SOFT_RESET = 已更新并复位；
@@ -143,6 +156,9 @@ static int fw_update_master(struct goodix_dev *d, uint8_t now_version[64])
     char ver[65];
     memcpy(ver, now_version, 64);
     ver[64] = 0;
+#if !GX_HAVE_BUNDLED_FW
+    (void)d;    /* 无固件镜像：只比较版本，不对设备做任何写操作 */
+#endif
 
     /* 1. MCU 不在 IAP 时比较版本 */
     if (!strstr(ver, "IAP")) {
@@ -151,6 +167,12 @@ static int fw_update_master(struct goodix_dev *d, uint8_t now_version[64])
             LOG("same version, no firmware update needed");
             return 1;
         }
+#if !GX_HAVE_BUNDLED_FW
+        LOG("firmware %.32s differs from the tested %s; this build bundles "
+            "no firmware and never flashes - continuing with the installed one",
+            ver, GF_FW_VERSION);
+        return 1;
+#else
         LOG("version differs, Clear App first");
         /* 0xA4 清除 APP 区；gx_send_cmd_wait 成功返回 0（此前这里
          * "r > 0" 分支永远不可达，属于死代码——清除后 MCU 重启进入
@@ -161,12 +183,19 @@ static int fw_update_master(struct goodix_dev *d, uint8_t now_version[64])
         gx_dev_evk(d, now_version);
         memcpy(ver, now_version, 64);
         ver[64] = 0;
+#endif
     }
 
     /* 2. 现在必须处于 IAP */
     if (strstr(ver, "IAP")) {
+#if GX_HAVE_BUNDLED_FW
         LOG("MCU in IAP, downloading firmware");
         return fw_update_core(d, gf_fw, GF_FW_LEN);
+#else
+        LOG("MCU is in IAP (no application firmware) and this build bundles "
+            "no firmware: restore it with the vendor Windows driver");
+        return 0;
+#endif
     }
 
     LOG("Fail to clear APP, MCU still not in IAP");
